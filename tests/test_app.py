@@ -101,20 +101,24 @@ async def _walk_to_gather(client):
 
 
 @pytest.mark.asyncio
-async def test_gather_evidence_rejects_unsurveyed_backend():
+async def test_gather_evidence_auto_registers_unsurveyed_backend():
+    """A successful query against a backend proves it's reachable, so the
+    FSM auto-registers it rather than trapping the agent. (Earlier strict
+    refusal looped weak models forever.)"""
     server = build_server()
     async with Client(server) as client:
-        await _walk_to_gather(client)
+        await _walk_to_gather(client)  # surveyed: prometheus, loki
         out = _payload(
             await _step(
                 client,
                 "gather_evidence",
-                backend="tempo",
+                backend="tempo",  # not surveyed
                 queries=[{"query": "x", "result_summary": "y"}],
             )
         )
-        assert out["error"] == "action_error"
-        assert "not in surveyed available_backends" in out["error_message"]
+        assert "error" not in out
+        assert "tempo" in out["state"]["available_backends"]
+        assert "tempo" in out["state"]["covered_backends"]
 
 
 @pytest.mark.asyncio

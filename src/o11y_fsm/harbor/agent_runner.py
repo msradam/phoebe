@@ -333,6 +333,7 @@ async def run_agent() -> None:
             ]
 
             step = 0
+            repeat_refusals: dict[str, int] = {}
             while step < MAX_STEPS:
                 step += 1
                 print(f"[{step}]", end=" ", flush=True)
@@ -378,6 +379,24 @@ async def run_agent() -> None:
                                 inputs = {}
                         obs = await call_advance_workflow(fsm_app, action, inputs)
                         print(f"FSM:{action}({obs.get('error', 'ok')})", end=" ", flush=True)
+                        # Loop-breaker: if the model keeps hitting the same
+                        # refusal, escalate the steering so it doesn't burn
+                        # the whole step budget on the same wall.
+                        refusal_key = f"{action}:{obs.get('error', '')}"
+                        if obs.get("error"):
+                            repeat_refusals[refusal_key] = repeat_refusals.get(refusal_key, 0) + 1
+                            if repeat_refusals[refusal_key] >= 3:
+                                obs = dict(obs)
+                                obs["_steering"] = (
+                                    f"You have hit this same refusal {repeat_refusals[refusal_key]} "
+                                    f"times. STOP repeating it. Look at valid_next_actions="
+                                    f"{obs.get('valid_next_actions')} and take a DIFFERENT action. "
+                                    f"If correlate is blocked because you need a 2nd backend, "
+                                    f"call gather_evidence with a DIFFERENT backend "
+                                    f"(e.g. loki if you've only done prometheus)."
+                                )
+                        else:
+                            repeat_refusals.clear()
                     else:
                         try:
                             obs_raw = await call_mcp_tool(session, fn, args)

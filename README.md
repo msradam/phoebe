@@ -75,6 +75,14 @@ The o11y-bench rubrics for the `investigation` task category grade on phase disc
 
 These are exactly the criteria an FSM gate can enforce mechanically. SKILL.md prose describes the methodology; this FSM is the methodology, refusing illegal transitions. A weak model that would otherwise skip phases under pressure has no legal step to take except the next phase.
 
+## A note on gate calibration
+
+FSM gates have to be calibrated. Too loose and they don't change behavior; too tight and they trap the agent.
+
+The first cut of `gather_evidence` hard-refused any backend not named in `survey_telemetry`. A weak model (Llama 3.3 70B) that surveyed only Prometheus then tried to query Loki got refused, couldn't reach the `correlate` gate (which needs ≥2 backends), and looped until the step limit. The fix: a successful query against a backend is itself proof the backend is reachable, so `gather_evidence` auto-registers it. The survey is a starting inventory, not a hard allow-list. The valuable constraint, "≥2 backends before correlation," stays; the counterproductive one was relaxed.
+
+The lesson generalizes: enforce the invariant that matters (don't conclude before cross-referencing) and let the agent discover the rest.
+
 ## Repo layout
 
 ```

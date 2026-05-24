@@ -140,7 +140,7 @@ async def survey_telemetry(
 
 @action(
     reads=["available_backends", "evidence_by_backend", "covered_backends", "log"],
-    writes=["evidence_by_backend", "covered_backends", "current_prompt", "log"],
+    writes=["available_backends", "evidence_by_backend", "covered_backends", "current_prompt", "log"],
 )
 async def gather_evidence(
     state: State,
@@ -151,15 +151,16 @@ async def gather_evidence(
     """Stash one round of evidence from one backend. Loop-able: call again
     with the same or a different backend.
 
-    Refuses ``backend`` not in the surveyed list (the SKILL says don't
-    fabricate evidence from a backend you didn't probe).
+    If ``backend`` wasn't in the surveyed list, it's auto-registered:
+    a successful query against a backend is itself proof the backend is
+    reachable, so refusing it would only trap the agent. The survey is a
+    starting inventory, not a hard allow-list. (Earlier the strict
+    refusal looped weaker models forever; see the gate-calibration note
+    in the README.)
     """
     backend_norm = (backend or "").strip().lower()
-    if backend_norm not in state["available_backends"]:
-        raise ValueError(
-            f"backend={backend!r} not in surveyed available_backends="
-            f"{state['available_backends']}. Survey it first or pick one you did survey."
-        )
+    if not backend_norm:
+        raise ValueError("backend must be a non-empty backend name")
     items = list(queries or [])
     if not items:
         raise ValueError("queries must contain at least one query record")
@@ -168,6 +169,10 @@ async def gather_evidence(
             raise ValueError(
                 f"queries[{i}] must be a dict with 'query' and 'result_summary'; got {q!r}"
             )
+    # Auto-register the backend if the agent discovered it mid-investigation.
+    available = list(state["available_backends"])
+    if backend_norm not in available:
+        available.append(backend_norm)
     evidence: dict[str, list[dict[str, Any]]] = {
         k: list(v) for k, v in state["evidence_by_backend"].items()
     }
@@ -175,12 +180,13 @@ async def gather_evidence(
         {"queries": items, "notable_observations": notable_observations.strip()}
     )
     covered = sorted(evidence.keys())
-    pending = [b for b in state["available_backends"] if b not in covered]
+    pending = [b for b in available if b not in covered]
     next_prompt = PROMPT_GATHER.format(
         pending_backends=pending,
         covered_backends=covered,
     )
     return state.update(
+        available_backends=available,
         evidence_by_backend=evidence,
         covered_backends=covered,
         current_prompt=next_prompt,
