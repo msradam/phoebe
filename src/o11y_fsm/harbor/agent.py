@@ -84,23 +84,17 @@ class O11yFSMAgent(BaseAgent):
     async def setup(self, environment: BaseEnvironment) -> None:
         await environment.exec(command="mkdir -p /app/o11y_fsm/harbor")
         # Runner script + prompts.
-        await environment.upload_file(
-            source_path=RUNNER_SCRIPT, target_path="/app/agent_runner.py"
-        )
+        await environment.upload_file(source_path=RUNNER_SCRIPT, target_path="/app/agent_runner.py")
         await environment.upload_file(
             source_path=SYSTEM_PROMPT, target_path="/app/system_prompt.txt"
         )
-        await environment.upload_file(
-            source_path=TASK_PROMPT, target_path="/app/task_prompt.txt"
-        )
+        await environment.upload_file(source_path=TASK_PROMPT, target_path="/app/task_prompt.txt")
         # The o11y_fsm package source so the runner can `import o11y_fsm`.
         for src in PACKAGE_ROOT.rglob("*.py"):
             if "__pycache__" in src.parts:
                 continue
             rel = src.relative_to(PACKAGE_ROOT)
-            await environment.upload_file(
-                source_path=src, target_path=f"/app/o11y_fsm/{rel}"
-            )
+            await environment.upload_file(source_path=src, target_path=f"/app/o11y_fsm/{rel}")
 
     async def run(
         self,

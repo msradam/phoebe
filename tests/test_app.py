@@ -1,8 +1,9 @@
-"""o11y-fsm: action-level validation + transition-gate enforcement.
+"""o11y-fsm v0.2 (circe-style): action bodies own the queries; phase is a
+state variable; gating lives in action bodies; hub topology.
 
-Pure orchestration tests — no LLM, no actual MCP server. The agent is
-simulated by feeding canned arguments into each step's inputs and
-reading state.current_prompt + valid_next_actions afterward.
+A MockTelemetryClient is bound per test so the query_* actions have a
+backend. The "agent" is simulated by feeding inputs into each step and
+reading state / valid_next_actions afterward.
 """
 
 from __future__ import annotations
@@ -13,6 +14,21 @@ import pytest
 from fastmcp import Client
 
 from o11y_fsm import build_server
+from o11y_fsm.telemetry import MockTelemetryClient, bind_telemetry_client
+
+_INCIDENT = "error rates jumped across services; triage primary vs cascade."
+
+
+@pytest.fixture(autouse=True)
+def _bind_mock_client():
+    """Every test gets a mock telemetry backend bound for the duration."""
+    token = bind_telemetry_client(MockTelemetryClient())
+    try:
+        yield
+    finally:
+        from o11y_fsm.telemetry import _CLIENT
+
+        _CLIENT.reset(token)
 
 
 async def _step(client, action, **inputs):
@@ -23,17 +39,25 @@ def _payload(result):
     return result.structured_content
 
 
-_INCIDENT = (
-    "We had a noisy incident window a few hours ago - error rates jumped "
-    "across services. Triage which is primary vs cascade."
-)
+async def _start(client):
+    await _step(
+        client,
+        "start_investigation",
+        incident_description=_INCIDENT,
+        scenario_time="2026-05-24T14:00Z",
+    )
+
+
+async def _probe_two_backends(client):
+    await _step(client, "query_metrics", promql="sum(rate(http_5xx[5m]))")
+    await _step(client, "query_logs", logql='{job="payment"} |= "error"')
 
 
 # == start_investigation ==============================================
 
 
 @pytest.mark.asyncio
-async def test_start_investigation_rejects_empty_description():
+async def test_start_rejects_empty_incident():
     server = build_server()
     async with Client(server) as client:
         out = _payload(await _step(client, "start_investigation", incident_description=""))
@@ -42,413 +66,181 @@ async def test_start_investigation_rejects_empty_description():
 
 
 @pytest.mark.asyncio
-async def test_start_investigation_emits_survey_prompt():
+async def test_start_sets_triage_phase_and_opens_hub():
     server = build_server()
     async with Client(server) as client:
-        out = _payload(
-            await _step(
-                client,
-                "start_investigation",
-                incident_description=_INCIDENT,
-                scenario_time="2026-05-24T14:00:00Z",
-            )
-        )
+        out = _payload(await _step(client, "start_investigation", incident_description=_INCIDENT))
+        assert out["state"]["phase"] == "triage"
+        # Hub: all operational actions reachable after start.
+        for a in ("query_metrics", "query_logs", "query_traces", "advance_phase", "conclude"):
+            assert a in out["valid_next_actions"]
+
+
+# == query actions own the telemetry ==================================
+
+
+@pytest.mark.asyncio
+async def test_query_metrics_records_probe_via_client():
+    server = build_server()
+    async with Client(server) as client:
+        await _start(client)
+        out = _payload(await _step(client, "query_metrics", promql="up"))
         assert "error" not in out
-        assert out["valid_next_actions"] == ["survey_telemetry"]
-        assert "SURVEY TELEMETRY" in out["state"]["current_prompt"]
-        assert "2026-05-24T14:00:00Z" in out["state"]["current_prompt"]
-
-
-# == survey_telemetry ================================================
+        probes = out["state"]["probes"]
+        assert len(probes) == 1
+        assert probes[0]["backend"] == "prometheus"
+        assert "prometheus" in out["state"]["distinct_backends"]
 
 
 @pytest.mark.asyncio
-async def test_survey_telemetry_refuses_empty_backends():
+async def test_query_rejects_empty_query():
     server = build_server()
     async with Client(server) as client:
-        await _step(client, "start_investigation", incident_description=_INCIDENT)
-        out = _payload(await _step(client, "survey_telemetry", available_backends=[]))
+        await _start(client)
+        out = _payload(await _step(client, "query_logs", logql="   "))
         assert out["error"] == "action_error"
+        assert "query must not be empty" in out["error_message"]
 
 
 @pytest.mark.asyncio
-async def test_survey_telemetry_normalizes_and_deduplicates():
+async def test_loop_guard_refuses_repeated_probe():
     server = build_server()
     async with Client(server) as client:
-        await _step(client, "start_investigation", incident_description=_INCIDENT)
-        out = _payload(
-            await _step(
-                client,
-                "survey_telemetry",
-                available_backends=["Prometheus", "loki", "PROMETHEUS"],
-                notable_services=["payment-service"],
-                time_window="last 6 hours",
-            )
-        )
-        assert out["state"]["available_backends"] == ["prometheus", "loki"]
-        assert out["state"]["notable_services"] == ["payment-service"]
-        assert "GATHER EVIDENCE" in out["state"]["current_prompt"]
-
-
-# == gather_evidence + the >=2-backend gate ==========================
-
-
-async def _walk_to_gather(client):
-    await _step(client, "start_investigation", incident_description=_INCIDENT)
-    await _step(
-        client, "survey_telemetry", available_backends=["prometheus", "loki"]
-    )
-
-
-@pytest.mark.asyncio
-async def test_gather_evidence_auto_registers_unsurveyed_backend():
-    """A successful query against a backend proves it's reachable, so the
-    FSM auto-registers it rather than trapping the agent. (Earlier strict
-    refusal looped weak models forever.)"""
-    server = build_server()
-    async with Client(server) as client:
-        await _walk_to_gather(client)  # surveyed: prometheus, loki
-        out = _payload(
-            await _step(
-                client,
-                "gather_evidence",
-                backend="tempo",  # not surveyed
-                queries=[{"query": "x", "result_summary": "y"}],
-            )
-        )
-        assert "error" not in out
-        assert "tempo" in out["state"]["available_backends"]
-        assert "tempo" in out["state"]["covered_backends"]
-
-
-@pytest.mark.asyncio
-async def test_gather_evidence_requires_query_records():
-    server = build_server()
-    async with Client(server) as client:
-        await _walk_to_gather(client)
-        out = _payload(
-            await _step(client, "gather_evidence", backend="prometheus", queries=[])
-        )
+        await _start(client)
+        await _step(client, "query_metrics", promql="up")
+        out = _payload(await _step(client, "query_metrics", promql="up"))
         assert out["error"] == "action_error"
+        assert "loop guard" in out["error_message"]
+
+
+# == advance_phase gating =============================================
 
 
 @pytest.mark.asyncio
-async def test_gather_evidence_validates_query_shape():
+async def test_advance_to_diagnose_requires_a_probe():
     server = build_server()
     async with Client(server) as client:
-        await _walk_to_gather(client)
+        await _start(client)
+        out = _payload(await _step(client, "advance_phase", to="diagnose", rationale="go"))
+        assert out["error"] == "action_error"
+        assert "at least 1 probe" in out["error_message"]
+
+
+@pytest.mark.asyncio
+async def test_advance_to_verify_requires_two_backends():
+    server = build_server()
+    async with Client(server) as client:
+        await _start(client)
+        await _step(client, "query_metrics", promql="up")
+        out = _payload(await _step(client, "advance_phase", to="verify", rationale="x"))
+        assert out["error"] == "action_error"
+        assert "distinct backends" in out["error_message"]
+
+
+@pytest.mark.asyncio
+async def test_advance_rejects_unknown_phase():
+    server = build_server()
+    async with Client(server) as client:
+        await _start(client)
+        out = _payload(await _step(client, "advance_phase", to="party", rationale="x"))
+        assert out["error"] == "action_error"
+        assert "phase must be one of" in out["error_message"]
+
+
+# == conclude gating ==================================================
+
+
+@pytest.mark.asyncio
+async def test_conclude_refused_before_verify_phase():
+    server = build_server()
+    async with Client(server) as client:
+        await _start(client)
+        await _probe_two_backends(client)
         out = _payload(
             await _step(
                 client,
-                "gather_evidence",
-                backend="prometheus",
-                queries=[{"query": "x"}],  # missing result_summary
+                "conclude",
+                primary_service="payment",
+                root_cause="pool exhaustion at 14:02 in payment-service",
+                final_answer="x" * 100,
             )
         )
         assert out["error"] == "action_error"
-        assert "result_summary" in out["error_message"]
+        assert "phase=='verify'" in out["error_message"]
 
 
 @pytest.mark.asyncio
-async def test_correlate_unreachable_with_one_backend():
-    """The load-bearing gate: <2 backends covered → correlate refused."""
+async def test_conclude_requires_verify_phase_probe():
+    """Reaching verify isn't enough; a probe must run DURING verify."""
     server = build_server()
     async with Client(server) as client:
-        await _walk_to_gather(client)
+        await _start(client)
+        await _probe_two_backends(client)
+        await _step(client, "advance_phase", to="verify", rationale="cross-referenced")
         out = _payload(
             await _step(
                 client,
-                "gather_evidence",
-                backend="prometheus",
-                queries=[{"query": "up", "result_summary": "all green"}],
-            )
-        )
-        assert "correlate" not in out["valid_next_actions"]
-        assert "gather_evidence" in out["valid_next_actions"]
-        # And explicitly: trying to correlate is invalid_transition.
-        out = _payload(
-            await _step(
-                client,
-                "correlate",
-                impacted_services=["x"],
-                time_window="now",
-                evidence_summary="x" * 50,
-            )
-        )
-        assert out["error"] == "invalid_transition"
-
-
-@pytest.mark.asyncio
-async def test_correlate_opens_when_two_backends_covered():
-    server = build_server()
-    async with Client(server) as client:
-        await _walk_to_gather(client)
-        await _step(
-            client,
-            "gather_evidence",
-            backend="prometheus",
-            queries=[{"query": "up", "result_summary": "all green"}],
-        )
-        out = _payload(
-            await _step(
-                client,
-                "gather_evidence",
-                backend="loki",
-                queries=[{"query": '{job="x"}', "result_summary": "many errors"}],
-            )
-        )
-        assert "correlate" in out["valid_next_actions"]
-        assert sorted(out["state"]["covered_backends"]) == ["loki", "prometheus"]
-
-
-# == correlate validation ============================================
-
-
-async def _walk_to_correlate(client):
-    await _walk_to_gather(client)
-    await _step(
-        client,
-        "gather_evidence",
-        backend="prometheus",
-        queries=[{"query": "up", "result_summary": "all green"}],
-    )
-    await _step(
-        client,
-        "gather_evidence",
-        backend="loki",
-        queries=[{"query": '{job="x"}', "result_summary": "many errors"}],
-    )
-
-
-@pytest.mark.asyncio
-async def test_correlate_refuses_thin_summary():
-    server = build_server()
-    async with Client(server) as client:
-        await _walk_to_correlate(client)
-        out = _payload(
-            await _step(
-                client,
-                "correlate",
-                impacted_services=["payment-service"],
-                time_window="last hour",
-                evidence_summary="thin",
+                "conclude",
+                primary_service="payment",
+                root_cause="pool exhaustion at 14:02",
+                final_answer="x" * 100,
             )
         )
         assert out["error"] == "action_error"
-        assert "substantive paragraph" in out["error_message"]
-
-
-# == hypothesis + verify-or-revise routing ===========================
-
-
-async def _walk_to_hypothesis(client):
-    await _walk_to_correlate(client)
-    await _step(
-        client,
-        "correlate",
-        impacted_services=["payment-service", "order-service"],
-        time_window="14:00 to 14:30",
-        evidence_summary=(
-            "Prom shows payment-service 5xx spiking at 14:02; Loki shows "
-            "order-service timeouts cascading from 14:04. Time-aligned across both."
-        ),
-    )
+        assert "during the verify phase" in out["error_message"]
 
 
 @pytest.mark.asyncio
-async def test_form_hypothesis_validates_confidence():
+async def test_happy_path_end_to_end():
     server = build_server()
     async with Client(server) as client:
-        await _walk_to_hypothesis(client)
+        await _start(client)
+        await _probe_two_backends(client)  # prometheus + loki
+        await _step(client, "advance_phase", to="diagnose", rationale="payment looks primary")
+        await _step(client, "advance_phase", to="verify", rationale="confirm pool exhaustion")
+        # verification probe DURING verify phase
+        await _step(client, "query_metrics", promql="pool_in_use{service='payment'}")
         out = _payload(
             await _step(
                 client,
-                "form_hypothesis",
+                "conclude",
                 primary_service="payment-service",
-                root_cause="connection-pool exhaustion at 14:02",
-                confidence="extremely-confident",  # not a valid value
-            )
-        )
-        assert out["error"] == "action_error"
-        assert "confidence must be one of" in out["error_message"]
-
-
-@pytest.mark.asyncio
-async def test_verify_disconfirmed_loops_back_to_hypothesis():
-    server = build_server()
-    async with Client(server) as client:
-        await _walk_to_hypothesis(client)
-        await _step(
-            client,
-            "form_hypothesis",
-            primary_service="payment-service",
-            root_cause="connection-pool exhaustion at 14:02",
-            cascade_services=["order-service"],
-            confidence="medium",
-        )
-        out = _payload(
-            await _step(
-                client,
-                "verify_or_revise",
-                verification_query='rate(connection_pool_exhausted{service="payment-service"}[5m])',
-                result_summary="no exhaustion events found in the window; metric is flat zero",
-                confirmed=False,
-                revised_root_cause="upstream auth-service intermittent failures",
-            )
-        )
-        assert "error" not in out
-        assert out["valid_next_actions"] == ["form_hypothesis"]
-
-
-@pytest.mark.asyncio
-async def test_verify_disconfirmed_requires_revised_root_cause():
-    server = build_server()
-    async with Client(server) as client:
-        await _walk_to_hypothesis(client)
-        await _step(
-            client,
-            "form_hypothesis",
-            primary_service="payment-service",
-            root_cause="pool exhaustion",
-            confidence="medium",
-        )
-        out = _payload(
-            await _step(
-                client,
-                "verify_or_revise",
-                verification_query="x",
-                result_summary="y",
-                confirmed=False,
-                # no revised_root_cause
-            )
-        )
-        assert out["error"] == "action_error"
-        assert "revised_root_cause" in out["error_message"]
-
-
-@pytest.mark.asyncio
-async def test_verify_confirmed_opens_recommendations():
-    server = build_server()
-    async with Client(server) as client:
-        await _walk_to_hypothesis(client)
-        await _step(
-            client,
-            "form_hypothesis",
-            primary_service="payment-service",
-            root_cause="pool exhaustion at 14:02",
-            confidence="high",
-        )
-        out = _payload(
-            await _step(
-                client,
-                "verify_or_revise",
-                verification_query="pool_in_use{service=payment-service}",
-                result_summary="maxed out at 14:02-14:08 window, confirms",
-                confirmed=True,
-            )
-        )
-        assert out["valid_next_actions"] == ["recommend_next_steps"]
-        assert "RECOMMEND" in out["state"]["current_prompt"]
-
-
-# == terminal ========================================================
-
-
-@pytest.mark.asyncio
-async def test_recommend_refuses_thin_final_answer():
-    server = build_server()
-    async with Client(server) as client:
-        await _walk_to_hypothesis(client)
-        await _step(
-            client,
-            "form_hypothesis",
-            primary_service="payment-service",
-            root_cause="pool exhaustion",
-            confidence="high",
-        )
-        await _step(
-            client,
-            "verify_or_revise",
-            verification_query="x",
-            result_summary="confirms",
-            confirmed=True,
-        )
-        out = _payload(
-            await _step(
-                client,
-                "recommend_next_steps",
-                recommendations=[{"action": "scale connection pool"}],
-                final_answer="too short",
-            )
-        )
-        assert out["error"] == "action_error"
-        assert "substantive markdown response" in out["error_message"]
-
-
-@pytest.mark.asyncio
-async def test_happy_path_walks_end_to_end():
-    server = build_server()
-    async with Client(server) as client:
-        await _walk_to_hypothesis(client)
-        await _step(
-            client,
-            "form_hypothesis",
-            primary_service="payment-service",
-            cascade_services=["order-service"],
-            root_cause="connection-pool exhaustion at 14:02 triggered by burst traffic",
-            confidence="high",
-        )
-        await _step(
-            client,
-            "verify_or_revise",
-            verification_query="pool_in_use",
-            result_summary="confirms exhaustion in the window",
-            confirmed=True,
-        )
-        out = _payload(
-            await _step(
-                client,
-                "recommend_next_steps",
-                recommendations=[
-                    {
-                        "action": "scale payment-service connection pool from 50 to 100",
-                        "owner": "payments-team",
-                        "evidence_ref": "verify: pool_in_use maxed 14:02-14:08",
-                    },
-                    {
-                        "action": "add p99 latency alert on order-service checkout path",
-                        "owner": "order-team",
-                        "evidence_ref": "correlate: cascade visible in Loki at 14:04",
-                    },
-                ],
+                cascade_services=["order-service"],
+                root_cause="connection-pool exhaustion at 14:02 under burst traffic",
                 final_answer=(
-                    "# Incident triage\n\n"
-                    "Primary: **payment-service** connection-pool exhaustion at 14:02. "
-                    "order-service is a downstream cascade (timeouts visible at 14:04). "
-                    "Recommended actions follow."
+                    "# Triage\n\nPrimary: payment-service pool exhaustion at 14:02. "
+                    "order-service cascade. Metrics + logs agree."
                 ),
             )
         )
         assert "error" not in out
         summary = out["state"]["investigation_summary"]
         assert summary["primary_service"] == "payment-service"
-        assert summary["n_recommendations"] == 2
-        assert sorted(summary["covered_backends"]) == ["loki", "prometheus"]
-
-
-# == audit trail ====================================================
+        assert sorted(summary["distinct_backends"]) == ["loki", "prometheus"]
+        assert summary["n_verify_probes"] >= 1
+        # Terminal: nothing reachable.
+        assert out["valid_next_actions"] == []
 
 
 @pytest.mark.asyncio
-async def test_history_records_each_phase():
+async def test_auto_registers_third_backend():
     server = build_server()
     async with Client(server) as client:
-        await _walk_to_correlate(client)
+        await _start(client)
+        await _step(client, "query_traces", traceql='{ span.name = "checkout" }')
+        out = _payload(await _step(client, "query_metrics", promql="up"))
+        assert sorted(out["state"]["distinct_backends"]) == ["prometheus", "tempo"]
+
+
+# == audit trail ======================================================
+
+
+@pytest.mark.asyncio
+async def test_history_records_steps():
+    server = build_server()
+    async with Client(server) as client:
+        await _start(client)
+        await _probe_two_backends(client)
         history = json.loads((await client.read_resource("burr://history"))[0].text)
         actions = [h["action"] for h in history]
-        assert actions == [
-            "start_investigation",
-            "survey_telemetry",
-            "gather_evidence",
-            "gather_evidence",
-        ]
+        assert actions == ["start_investigation", "query_metrics", "query_logs"]

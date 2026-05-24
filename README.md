@@ -4,15 +4,16 @@ An observability / SRE incident-investigation finite-state machine for LLM-drive
 
 ```text
 start_investigation
-  → survey_telemetry              (which backends are reachable?)
-    → gather_evidence  (loops)    (≥2 backends required before correlation)
-      → correlate                 (cross-reference services + windows)
-        → form_hypothesis         (primary vs cascade, confidence)
-          → verify_or_revise      (focused query; disconfirms loop back)
-            → recommend_next_steps  (terminal; cites evidence refs)
+  ├─ query_metrics(promql)   ┐  the query actions ARE the operations:
+  ├─ query_logs(logql)       │  each runs the query through a bound
+  ├─ query_traces(traceql)   ┘  telemetry client and records evidence
+  ├─ advance_phase(to, rationale)   triage → diagnose → verify
+  └─ conclude(primary_service, root_cause, final_answer, cascade_services)
 ```
 
-Each phase is a `step()` call against the mounted MCP server. The FSM refuses out-of-order calls with structured payloads listing what's reachable. State + audit trail live on the server.
+Hub topology: every operational action is reachable from every other. The methodology is enforced inside action bodies, not by narrowing the graph (this is what makes a mid-size model able to *drive* the FSM instead of fighting it). `conclude` is gated: phase must be `verify`, you need probes from ≥2 distinct backends, and at least one probe must have run during the verify phase. A repeated identical probe is refused ("vary the probe").
+
+The design follows the pattern proven in a sibling project (circe): **the operation is the FSM action.** There is no separate "do work here, record it there" surface; calling `query_metrics` runs the query and advances state in one step. State + audit trail live on the server.
 
 ## What it gives the caller
 
@@ -75,13 +76,13 @@ The o11y-bench rubrics for the `investigation` task category grade on phase disc
 
 These are exactly the criteria an FSM gate can enforce mechanically. SKILL.md prose describes the methodology; this FSM is the methodology, refusing illegal transitions. A weak model that would otherwise skip phases under pressure has no legal step to take except the next phase.
 
-## A note on gate calibration
+## Design note: why single-surface
 
-FSM gates have to be calibrated. Too loose and they don't change behavior; too tight and they trap the agent.
+The first cut (v0.1) split the work across two tool surfaces: the agent used the harness's raw Grafana MCP tools to query, then *separately* called the FSM to record what it found. A mid-size model (Llama 3.3 70B) got absorbed in the query surface and never crossed to the bookkeeping surface, looping `query_prometheus` dozens of times without ever advancing the FSM.
 
-The first cut of `gather_evidence` hard-refused any backend not named in `survey_telemetry`. A weak model (Llama 3.3 70B) that surveyed only Prometheus then tried to query Loki got refused, couldn't reach the `correlate` gate (which needs ≥2 backends), and looped until the step limit. The fix: a successful query against a backend is itself proof the backend is reachable, so `gather_evidence` auto-registers it. The survey is a starting inventory, not a hard allow-list. The valuable constraint, "≥2 backends before correlation," stays; the counterproductive one was relaxed.
+The fix (v0.2) collapses to one surface: the query actions ARE the operations. The only way to touch telemetry is through `query_metrics` / `query_logs` / `query_traces`, each of which runs the query and records evidence in a single step. There is no second surface to get stuck on. This mirrors the design of a sibling Burr agent (circe), where the same model drives a comparable FSM reliably.
 
-The lesson generalizes: enforce the invariant that matters (don't conclude before cross-referencing) and let the agent discover the rest.
+The accompanying lesson on gate calibration: enforce the invariant that matters (don't conclude before cross-referencing ≥2 backends, don't conclude without a verifying probe) via action-body checks, and keep graph reachability broad so the agent is never told "no" by the graph for a normal operation. A repeated identical probe is refused with a specific reason ("vary the probe"), not a dead end.
 
 ## Repo layout
 

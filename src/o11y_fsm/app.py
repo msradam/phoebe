@@ -1,40 +1,136 @@
-"""o11y-fsm Burr Application: SRE incident-investigation as enforced phases.
+"""o11y-fsm Burr Application: SRE incident investigation, circe-style.
 
-This is the load-bearing module. Each action validates inputs, updates
-state, and emits the prompt for the next phase. Gates between phases
-enforce the SRE methodology:
+Design (learned from circe, github project "madeline/circe"):
 
-* You cannot correlate until you have evidence from >=2 distinct backends.
-* You cannot form a hypothesis until correlation has run.
-* You cannot recommend next steps until your hypothesis has been verified
-  (i.e. ``verify_or_revise`` returned with ``confirmed=True``).
-* A disconfirmed hypothesis loops back to ``form_hypothesis`` rather than
-  letting the agent abandon the investigation.
+* **The operation IS the FSM action.** ``query_metrics`` / ``query_logs``
+  / ``query_traces`` actually run the telemetry query (through a bound
+  ``TelemetryClient``) and record the evidence in one step. There is no
+  separate "do work elsewhere, then report it" surface; that split is
+  what made the earlier v0.1 design loop weak models.
 
-The Burr application is mounted as an MCP server via burrmcp.mount(...)
-in ``build_server()``. The action namespace lives in the ``step`` tool's
-argument schema.
+* **Phase is a state variable, not a graph node.** ``phase`` moves
+  ``triage -> diagnose -> verify`` via ``advance_phase(to, rationale)``.
+  Operations and ``conclude`` consult it.
+
+* **Hub topology + body-level gating.** Every operational action is
+  reachable from every other (broad reachability). The methodology is
+  enforced inside action bodies (``advance_phase`` requires probes;
+  ``conclude`` requires phase==verify + >=2 backends + a verifying probe),
+  not by narrowing graph reachability. The agent is never told "no" by
+  the graph for a normal operation; only by a body raising ValueError
+  with a specific, recoverable reason.
+
+* **Loop guard.** The same ``(backend, query)`` within a short window is
+  refused ("vary the probe"), so a weak model can't burn its budget
+  re-running one query.
+
+The query actions reach the backend through ``telemetry.get_telemetry_client``;
+bind one with ``telemetry.bind_telemetry_client(...)`` before stepping
+(the Harbor runner binds a Grafana-MCP-backed client; tests bind a
+``MockTelemetryClient``).
 """
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 
-from burr.core import ApplicationBuilder, Condition, State, action
+from burr.core import ApplicationBuilder, State, action
+from burr.core.action import Condition
 
-from o11y_fsm.prompts import (
-    PROMPT_CORRELATE,
-    PROMPT_GATHER,
-    PROMPT_HYPOTHESIS,
-    PROMPT_RECOMMEND,
-    PROMPT_SURVEY,
-    PROMPT_VERIFY,
-)
+from o11y_fsm import prompts
+from o11y_fsm.telemetry import require_telemetry_client
 
 _TRACKER_PROJECT = "o11y-fsm"
 
-_MIN_BACKENDS = 2
-_VALID_CONFIDENCE = {"low", "medium", "high"}
+_PHASES = ("triage", "diagnose", "verify")
+_DEFAULT_PHASE = "triage"
+_BACKEND_ALIASES = {
+    "metrics": "prometheus",
+    "prom": "prometheus",
+    "prometheus": "prometheus",
+    "logs": "loki",
+    "loki": "loki",
+    "traces": "tempo",
+    "tempo": "tempo",
+}
+_LOOP_GUARD_WINDOW = 4
+_MIN_BACKENDS_TO_CONCLUDE = 2
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _probe_hash(backend: str, query: str) -> str:
+    return f"{backend}::{query.strip()}"
+
+
+def _distinct_backends(probes: list[dict[str, Any]]) -> set[str]:
+    return {p["backend"] for p in probes if p.get("backend")}
+
+
+async def _run_probe(
+    state: State[Any],
+    *,
+    backend: str,
+    query: str,
+    hypothesis: str | None,
+) -> State[Any]:
+    """Shared body for the three query_* actions.
+
+    Executes the query through the bound telemetry client, records the
+    probe (with the phase it ran in, so post-verify verification probes
+    can be counted), and enforces the loop guard.
+    """
+    query = (query or "").strip()
+    if not query:
+        raise ValueError("query must not be empty")
+    backend = _BACKEND_ALIASES.get((backend or "").strip().lower(), (backend or "").strip().lower())
+
+    recent = state.get("recent_probe_hashes") or []
+    h = _probe_hash(backend, query)
+    if h in recent[-_LOOP_GUARD_WINDOW:]:
+        raise ValueError(
+            f"loop guard: this exact {backend} query ran within the last "
+            f"{_LOOP_GUARD_WINDOW} probes. Vary the probe (different query, "
+            f"different backend) or, if you have enough evidence, "
+            f"advance_phase / conclude."
+        )
+
+    client = require_telemetry_client()
+    result = await client.query(backend, query)
+    ok = bool(result.get("ok", True))
+    summary = str(result.get("summary", "")).strip() or "(no summary)"
+
+    phase = state.get("phase") or _DEFAULT_PHASE
+    probe = {
+        "backend": backend,
+        "query": query,
+        "ok": ok,
+        "summary": summary,
+        "hypothesis": (hypothesis or "").strip(),
+        "phase": phase,
+        "ts": _now(),
+    }
+    probes = [*(state.get("probes") or []), probe]
+    distinct = sorted(_distinct_backends(probes))
+    next_recent = [*recent, h][-(_LOOP_GUARD_WINDOW * 2) :]
+
+    prompt = prompts.after_probe(
+        backend=backend,
+        summary=summary,
+        phase=phase,
+        distinct_backends=distinct,
+        n_probes=len(probes),
+    )
+    return state.update(
+        probes=probes,
+        distinct_backends=distinct,
+        recent_probe_hashes=next_recent,
+        current_prompt=prompt,
+        log=[*state["log"], f"probe {backend}: {summary[:60]}"],
+    )
 
 
 # == actions ==========================================================
@@ -45,398 +141,278 @@ _VALID_CONFIDENCE = {"low", "medium", "high"}
     writes=[
         "incident_description",
         "scenario_time",
-        "available_backends",
-        "notable_services",
-        "time_window",
-        "evidence_by_backend",
-        "covered_backends",
-        "correlation",
+        "phase",
+        "phase_history",
+        "probes",
+        "distinct_backends",
+        "recent_probe_hashes",
         "hypothesis",
-        "verification",
-        "recommendations",
         "final_answer",
+        "investigation_summary",
         "current_prompt",
         "log",
     ],
 )
 async def start_investigation(
-    state: State,
+    state: State[Any],
     incident_description: str,
     scenario_time: str | None = None,
-) -> State:
-    """Open the investigation. Captures the prompt + scenario clock,
-    emits the Phase-1 (survey) instruction.
+) -> State[Any]:
+    """Open the investigation. Phase starts at ``triage``.
 
     Args:
-        incident_description: The natural-language incident statement,
-            verbatim from the operator / bench task.
-        scenario_time: Optional ISO-8601 anchor for the scenario clock.
-            o11y-bench provides this as ``scenario_time.txt``; for
-            non-bench use it can be None or "now".
+        incident_description: the incident statement, verbatim.
+        scenario_time: optional ISO anchor for the scenario clock.
     """
     if not incident_description.strip():
         raise ValueError("incident_description must not be empty")
     scenario_time = (scenario_time or "now").strip()
-    prompt = PROMPT_SURVEY.format(
-        incident_description=incident_description.strip(),
-        scenario_time=scenario_time,
-    )
     return state.update(
         incident_description=incident_description.strip(),
         scenario_time=scenario_time,
-        available_backends=[],
-        notable_services=[],
-        time_window="",
-        evidence_by_backend={},
-        covered_backends=[],
-        correlation=None,
+        phase=_DEFAULT_PHASE,
+        phase_history=[],
+        probes=[],
+        distinct_backends=[],
+        recent_probe_hashes=[],
         hypothesis=None,
-        verification=None,
-        recommendations=[],
         final_answer=None,
-        current_prompt=prompt,
-        log=[f"Investigation started; scenario_time={scenario_time!r}"],
+        investigation_summary=None,
+        current_prompt=prompts.after_start(incident_description.strip(), scenario_time),
+        log=[f"investigation started; scenario_time={scenario_time!r}"],
     )
 
 
 @action(
-    reads=["log"],
-    writes=["available_backends", "notable_services", "time_window", "current_prompt", "log"],
+    reads=["phase", "probes", "distinct_backends", "recent_probe_hashes", "log"],
+    writes=["probes", "distinct_backends", "recent_probe_hashes", "current_prompt", "log"],
 )
-async def survey_telemetry(
-    state: State,
-    available_backends: list[str],
-    notable_services: list[str] | None = None,
-    time_window: str = "",
-) -> State:
-    """Record the reachable backends + initial scoping. The FSM remembers
-    the list so later gates can refuse evidence from backends not
-    surveyed and refuse correlation before >=2 backends are covered.
+async def query_metrics(
+    state: State[Any], promql: str, hypothesis: str | None = None
+) -> State[Any]:
+    """Run a Prometheus (metrics) query and record the evidence.
+
+    Args:
+        promql: the PromQL query string.
+        hypothesis: optional short reason for this probe.
     """
-    backends = [b.strip().lower() for b in (available_backends or []) if b and b.strip()]
-    if len(backends) < 1:
+    return await _run_probe(state, backend="prometheus", query=promql, hypothesis=hypothesis)
+
+
+@action(
+    reads=["phase", "probes", "distinct_backends", "recent_probe_hashes", "log"],
+    writes=["probes", "distinct_backends", "recent_probe_hashes", "current_prompt", "log"],
+)
+async def query_logs(state: State[Any], logql: str, hypothesis: str | None = None) -> State[Any]:
+    """Run a Loki (logs) query and record the evidence.
+
+    Args:
+        logql: the LogQL query string.
+        hypothesis: optional short reason for this probe.
+    """
+    return await _run_probe(state, backend="loki", query=logql, hypothesis=hypothesis)
+
+
+@action(
+    reads=["phase", "probes", "distinct_backends", "recent_probe_hashes", "log"],
+    writes=["probes", "distinct_backends", "recent_probe_hashes", "current_prompt", "log"],
+)
+async def query_traces(
+    state: State[Any], traceql: str, hypothesis: str | None = None
+) -> State[Any]:
+    """Run a Tempo (traces) query and record the evidence.
+
+    Args:
+        traceql: the TraceQL query string.
+        hypothesis: optional short reason for this probe.
+    """
+    return await _run_probe(state, backend="tempo", query=traceql, hypothesis=hypothesis)
+
+
+@action(
+    reads=["phase", "phase_history", "probes", "distinct_backends", "log"],
+    writes=["phase", "phase_history", "current_prompt", "log"],
+)
+async def advance_phase(state: State[Any], to: str, rationale: str) -> State[Any]:
+    """Advance the investigation phase. Gated on evidence.
+
+    Phases:
+      - ``triage``   initial context gathering (default).
+      - ``diagnose`` working a hypothesis; needs >=1 probe.
+      - ``verify``   confirming the leading hypothesis; needs probes from
+        >=2 distinct backends (you can't conclude a cross-cutting incident
+        from a single signal).
+
+    The hard gate for the final answer lives on ``conclude``; this action
+    just enforces that you don't skip the investigation the phase implies.
+    """
+    to = (to or "").strip().lower()
+    if to not in _PHASES:
+        raise ValueError(f"phase must be one of {list(_PHASES)}; got {to!r}")
+    if not rationale.strip():
+        raise ValueError("advance_phase requires a non-empty rationale")
+
+    probes = state.get("probes") or []
+    distinct = _distinct_backends(probes)
+    if to == "diagnose" and len(probes) < 1:
         raise ValueError(
-            "available_backends must list at least one backend you confirmed reachable"
+            "advance_phase(to='diagnose') requires at least 1 probe first. "
+            "Run a query_metrics / query_logs / query_traces to gather evidence."
         )
-    # deduplicate preserving order
-    seen: set[str] = set()
-    deduped: list[str] = []
-    for b in backends:
-        if b not in seen:
-            seen.add(b)
-            deduped.append(b)
-    next_prompt = PROMPT_GATHER.format(
-        pending_backends=deduped,
-        covered_backends=[],
-    )
-    return state.update(
-        available_backends=deduped,
-        notable_services=list(notable_services or []),
-        time_window=time_window.strip(),
-        current_prompt=next_prompt,
-        log=[*state["log"], f"Survey: backends={deduped}"],
-    )
-
-
-@action(
-    reads=["available_backends", "evidence_by_backend", "covered_backends", "log"],
-    writes=["available_backends", "evidence_by_backend", "covered_backends", "current_prompt", "log"],
-)
-async def gather_evidence(
-    state: State,
-    backend: str,
-    queries: list[dict[str, Any]],
-    notable_observations: str = "",
-) -> State:
-    """Stash one round of evidence from one backend. Loop-able: call again
-    with the same or a different backend.
-
-    If ``backend`` wasn't in the surveyed list, it's auto-registered:
-    a successful query against a backend is itself proof the backend is
-    reachable, so refusing it would only trap the agent. The survey is a
-    starting inventory, not a hard allow-list. (Earlier the strict
-    refusal looped weaker models forever; see the gate-calibration note
-    in the README.)
-    """
-    backend_norm = (backend or "").strip().lower()
-    if not backend_norm:
-        raise ValueError("backend must be a non-empty backend name")
-    items = list(queries or [])
-    if not items:
-        raise ValueError("queries must contain at least one query record")
-    for i, q in enumerate(items):
-        if not isinstance(q, dict) or "query" not in q or "result_summary" not in q:
-            raise ValueError(
-                f"queries[{i}] must be a dict with 'query' and 'result_summary'; got {q!r}"
-            )
-    # Auto-register the backend if the agent discovered it mid-investigation.
-    available = list(state["available_backends"])
-    if backend_norm not in available:
-        available.append(backend_norm)
-    evidence: dict[str, list[dict[str, Any]]] = {
-        k: list(v) for k, v in state["evidence_by_backend"].items()
-    }
-    evidence.setdefault(backend_norm, []).append(
-        {"queries": items, "notable_observations": notable_observations.strip()}
-    )
-    covered = sorted(evidence.keys())
-    pending = [b for b in available if b not in covered]
-    next_prompt = PROMPT_GATHER.format(
-        pending_backends=pending,
-        covered_backends=covered,
-    )
-    return state.update(
-        available_backends=available,
-        evidence_by_backend=evidence,
-        covered_backends=covered,
-        current_prompt=next_prompt,
-        log=[*state["log"], f"Evidence: backend={backend_norm} ({len(items)} query/queries)"],
-    )
-
-
-@action(
-    reads=["covered_backends", "log"],
-    writes=["correlation", "current_prompt", "log"],
-)
-async def correlate(
-    state: State,
-    impacted_services: list[str],
-    time_window: str,
-    evidence_summary: str,
-) -> State:
-    """Record the cross-referenced findings. Gated server-side: not
-    reachable until >=2 distinct backends are covered.
-    """
-    services = [s.strip() for s in (impacted_services or []) if s and s.strip()]
-    if not services:
-        raise ValueError("impacted_services must name at least one service")
-    if not time_window.strip():
-        raise ValueError("time_window must be a non-empty window string")
-    if len(evidence_summary.strip()) < 40:
+    if to == "verify" and len(distinct) < _MIN_BACKENDS_TO_CONCLUDE:
         raise ValueError(
-            "evidence_summary must be a substantive paragraph (>=40 chars). "
-            "The SKILL prescribes cross-referencing across backends; thin "
-            "summaries indicate the correlation hasn't been done."
+            f"advance_phase(to='verify') requires probes from at least "
+            f"{_MIN_BACKENDS_TO_CONCLUDE} distinct backends; you have "
+            f"{sorted(distinct)}. Cross-reference at least one more backend "
+            f"(e.g. logs if you've only queried metrics) before verifying."
         )
-    correlation = {
-        "impacted_services": services,
-        "time_window": time_window.strip(),
-        "evidence_summary": evidence_summary.strip(),
-    }
+
+    prev = state.get("phase") or _DEFAULT_PHASE
+    history = [
+        *(state.get("phase_history") or []),
+        {"from": prev, "to": to, "rationale": rationale.strip(), "ts": _now()},
+    ]
     return state.update(
-        correlation=correlation,
-        current_prompt=PROMPT_HYPOTHESIS,
-        log=[
-            *state["log"],
-            f"Correlate: {len(services)} impacted service(s) over {time_window!r}",
-        ],
-    )
-
-
-@action(
-    reads=["correlation", "log"],
-    writes=["hypothesis", "verification", "current_prompt", "log"],
-)
-async def form_hypothesis(
-    state: State,
-    primary_service: str,
-    root_cause: str,
-    cascade_services: list[str] | None = None,
-    confidence: str = "medium",
-) -> State:
-    """Commit to a root-cause hypothesis. Called once initially; can be
-    re-called after a disconfirming ``verify_or_revise``.
-    """
-    primary = (primary_service or "").strip()
-    if not primary:
-        raise ValueError("primary_service must not be empty (use 'unknown' if truly unclear)")
-    if not root_cause.strip():
-        raise ValueError("root_cause must not be empty")
-    conf = (confidence or "").strip().lower()
-    if conf not in _VALID_CONFIDENCE:
-        raise ValueError(
-            f"confidence must be one of {sorted(_VALID_CONFIDENCE)}; got {confidence!r}"
-        )
-    hypothesis = {
-        "primary_service": primary,
-        "cascade_services": [s.strip() for s in (cascade_services or []) if s and s.strip()],
-        "root_cause": root_cause.strip(),
-        "confidence": conf,
-    }
-    next_prompt = PROMPT_VERIFY.format(
-        primary_service=hypothesis["primary_service"],
-        cascade_services=hypothesis["cascade_services"],
-        root_cause=hypothesis["root_cause"],
-    )
-    return state.update(
-        hypothesis=hypothesis,
-        verification=None,  # invalidate any prior verification when revising
-        current_prompt=next_prompt,
-        log=[
-            *state["log"],
-            f"Hypothesis: primary={primary!r} confidence={conf} ({len(hypothesis['cascade_services'])} cascade)",
-        ],
-    )
-
-
-@action(
-    reads=["hypothesis", "covered_backends", "log"],
-    writes=["verification", "current_prompt", "log"],
-)
-async def verify_or_revise(
-    state: State,
-    verification_query: str,
-    result_summary: str,
-    confirmed: bool,
-    revised_root_cause: str = "",
-) -> State:
-    """Run a focused verification. If confirmed, opens the path to
-    recommendations. If not confirmed, the FSM routes back to
-    ``form_hypothesis`` for revision.
-    """
-    if not verification_query.strip():
-        raise ValueError("verification_query must not be empty")
-    if not result_summary.strip():
-        raise ValueError("result_summary must not be empty")
-    verification = {
-        "verification_query": verification_query.strip(),
-        "result_summary": result_summary.strip(),
-        "confirmed": bool(confirmed),
-        "revised_root_cause": revised_root_cause.strip(),
-    }
-    if not confirmed:
-        if not revised_root_cause.strip():
-            raise ValueError(
-                "confirmed=False requires revised_root_cause (so the next "
-                "form_hypothesis call has something to revise toward)"
-            )
-        next_prompt = (
-            f"Verification disconfirmed your hypothesis. Revise: the data "
-            f"suggests {revised_root_cause.strip()!r}. Call form_hypothesis "
-            f"again with an updated primary_service / root_cause."
-        )
-        log_note = "Verify: DISCONFIRMED, looping to form_hypothesis"
-    else:
-        hyp = state["hypothesis"] or {}
-        next_prompt = PROMPT_RECOMMEND.format(
-            primary_service=hyp.get("primary_service", "?"),
-            root_cause=hyp.get("root_cause", "?"),
-            covered_backends=state["covered_backends"],
-        )
-        log_note = "Verify: CONFIRMED, opening recommendations"
-    return state.update(
-        verification=verification,
-        current_prompt=next_prompt,
-        log=[*state["log"], log_note],
+        phase=to,
+        phase_history=history,
+        current_prompt=prompts.after_advance(to, sorted(distinct), len(probes)),
+        log=[*state["log"], f"phase {prev} -> {to}: {rationale.strip()[:60]}"],
     )
 
 
 @action(
     reads=[
         "incident_description",
-        "evidence_by_backend",
-        "covered_backends",
-        "correlation",
-        "hypothesis",
-        "verification",
+        "phase",
+        "probes",
+        "distinct_backends",
         "log",
     ],
-    writes=["recommendations", "final_answer", "investigation_summary", "current_prompt", "log"],
+    writes=["hypothesis", "final_answer", "investigation_summary", "current_prompt", "log"],
 )
-async def recommend_next_steps(
-    state: State,
-    recommendations: list[dict[str, Any]],
+async def conclude(
+    state: State[Any],
+    primary_service: str,
+    root_cause: str,
     final_answer: str,
-) -> State:
-    """Terminal. Records actionable next steps + the final answer the
-    operator (or bench grader) reads.
+    cascade_services: list[str] | None = None,
+) -> State[Any]:
+    """Terminal. Commit the conclusion + final answer. Gated.
+
+    Requires:
+      - phase == ``verify`` (you advanced through the methodology),
+      - probes from >= 2 distinct backends,
+      - at least one probe taken DURING the verify phase (the verification
+        step: you confirmed the leading hypothesis, not just asserted it).
+
+    Args:
+        primary_service: the single service judged the root cause
+            (or "unknown" with justification in root_cause).
+        root_cause: 1-2 sentences naming the most likely root cause.
+        final_answer: full markdown response the operator/grader reads.
+        cascade_services: services impacted as downstream consequences.
     """
-    items = list(recommendations or [])
-    if not items:
-        raise ValueError("recommendations must include at least one item")
-    for i, r in enumerate(items):
-        if not isinstance(r, dict) or "action" not in r:
-            raise ValueError(f"recommendations[{i}] must be a dict with 'action'; got {r!r}")
+    phase = state.get("phase") or _DEFAULT_PHASE
+    if phase != "verify":
+        raise ValueError(
+            f"conclude requires phase=='verify'; current phase is {phase!r}. "
+            "Call advance_phase(to='verify', rationale=...) once you have "
+            "cross-referenced evidence and a leading hypothesis."
+        )
+    probes = state.get("probes") or []
+    distinct = _distinct_backends(probes)
+    if len(distinct) < _MIN_BACKENDS_TO_CONCLUDE:
+        raise ValueError(
+            f"conclude requires probes from >= {_MIN_BACKENDS_TO_CONCLUDE} distinct "
+            f"backends; you have {sorted(distinct)}."
+        )
+    verify_probes = [p for p in probes if p.get("phase") == "verify"]
+    if not verify_probes:
+        raise ValueError(
+            "conclude requires at least one probe taken during the verify phase. "
+            "Run a focused query that confirms (or refutes) your leading "
+            "hypothesis, then conclude."
+        )
+    primary = (primary_service or "").strip()
+    if not primary:
+        raise ValueError("primary_service must not be empty (use 'unknown' if truly unclear)")
+    if not root_cause.strip():
+        raise ValueError("root_cause must not be empty")
     if len(final_answer.strip()) < 80:
         raise ValueError(
-            "final_answer must be a substantive markdown response "
-            "(>=80 chars). The bench grader reads this verbatim."
+            "final_answer must be a substantive markdown response (>=80 chars); "
+            "the grader reads it verbatim."
         )
-    hyp = state["hypothesis"] or {}
+
+    hypothesis = {
+        "primary_service": primary,
+        "cascade_services": [s.strip() for s in (cascade_services or []) if s and s.strip()],
+        "root_cause": root_cause.strip(),
+    }
     summary = {
         "incident_description": state["incident_description"],
-        "primary_service": hyp.get("primary_service"),
-        "root_cause": hyp.get("root_cause"),
-        "covered_backends": state["covered_backends"],
-        "n_recommendations": len(items),
+        "primary_service": primary,
+        "cascade_services": hypothesis["cascade_services"],
+        "root_cause": hypothesis["root_cause"],
+        "distinct_backends": sorted(distinct),
+        "n_probes": len(probes),
+        "n_verify_probes": len(verify_probes),
         "final_answer_chars": len(final_answer),
     }
     return state.update(
-        recommendations=items,
+        hypothesis=hypothesis,
         final_answer=final_answer.strip(),
         investigation_summary=summary,
         current_prompt="Investigation complete. Final answer in state.final_answer.",
-        log=[
-            *state["log"],
-            f"Recommendations: {len(items)} item(s). Investigation complete.",
-        ],
+        log=[*state["log"], f"concluded: primary={primary!r}; {len(probes)} probe(s)"],
     )
 
 
-# == graph ============================================================
+# == graph (hub topology) =============================================
+
+_HUB = ("query_metrics", "query_logs", "query_traces", "advance_phase", "conclude")
+
+# Every transition carries an explicit condition. Burr only rejects
+# multiple *unconditional* (default) transitions from one source; giving
+# each an explicit condition makes the hub legal. ``_OPEN`` is true while
+# the investigation hasn't concluded, so all hub actions are reachable
+# until conclude sets final_answer (after which nothing is, => terminal).
+# Methodology gating lives in the action bodies, not here (circe-style).
+_OPEN = Condition.expr("final_answer is None")
 
 
-# Gate: at least 2 distinct backends covered → correlate opens.
-_HAVE_TWO_BACKENDS = Condition.expr(f"len(covered_backends) >= {_MIN_BACKENDS}")
-_NEED_MORE_BACKENDS = Condition.expr(f"len(covered_backends) < {_MIN_BACKENDS}")
-
-# Gate: verify_or_revise outcome drives the routing.
-_HYPOTHESIS_CONFIRMED = Condition.expr(
-    "verification is not None and bool(verification.get('confirmed'))"
-)
-_HYPOTHESIS_DISCONFIRMED = Condition.expr(
-    "verification is not None and not bool(verification.get('confirmed'))"
-)
+def _hub_transitions() -> list[tuple[str, str, Condition]]:
+    transitions: list[tuple[str, str, Condition]] = [
+        ("start_investigation", a, _OPEN) for a in _HUB
+    ]
+    for src in _HUB:
+        if src == "conclude":
+            continue
+        for dst in _HUB:
+            transitions.append((src, dst, _OPEN))
+    return transitions
 
 
 def build_application(tracking: bool = True):
     """Build the o11y-fsm Burr Application.
 
-    Returns a fresh ``burr.core.Application`` per call; pass this function
-    (not its result) as the factory to ``mount(...)`` for per-session
-    state isolation.
-
     Args:
-        tracking: wire a ``LocalTrackingClient`` so the session shows up in
-            the Burr UI and ``burrmcp sessions`` commands. Default True.
-            Set False in minimal environments (e.g. the Harbor agent runner
-            inside a container) where the tracking extra's transitive
-            ``psutil`` build dependency isn't available; the FSM logic is
-            identical, only the on-disk audit trail is skipped.
+        tracking: wire a ``LocalTrackingClient`` for Burr UI + ``burrmcp
+            sessions`` visibility. Default True. Set False in minimal
+            environments (the Harbor container has no compiler for
+            psutil, pulled transitively by the tracking extra).
     """
     builder = (
         ApplicationBuilder()
         .with_actions(
             start_investigation=start_investigation,
-            survey_telemetry=survey_telemetry,
-            gather_evidence=gather_evidence,
-            correlate=correlate,
-            form_hypothesis=form_hypothesis,
-            verify_or_revise=verify_or_revise,
-            recommend_next_steps=recommend_next_steps,
+            query_metrics=query_metrics,
+            query_logs=query_logs,
+            query_traces=query_traces,
+            advance_phase=advance_phase,
+            conclude=conclude,
         )
-        .with_transitions(
-            ("start_investigation", "survey_telemetry"),
-            ("survey_telemetry", "gather_evidence"),
-            # gather_evidence loops until >=2 backends are covered, then opens correlate.
-            ("gather_evidence", "gather_evidence", _NEED_MORE_BACKENDS),
-            ("gather_evidence", "correlate", _HAVE_TWO_BACKENDS),
-            ("correlate", "form_hypothesis"),
-            ("form_hypothesis", "verify_or_revise"),
-            # verify outcome: confirmed -> recommend; disconfirmed -> back to form_hypothesis.
-            ("verify_or_revise", "recommend_next_steps", _HYPOTHESIS_CONFIRMED),
-            ("verify_or_revise", "form_hypothesis", _HYPOTHESIS_DISCONFIRMED),
-        )
+        .with_transitions(*_hub_transitions())
     )
     if tracking:
         from burr.tracking.client import LocalTrackingClient
@@ -446,15 +422,12 @@ def build_application(tracking: bool = True):
         builder.with_state(
             incident_description="",
             scenario_time="",
-            available_backends=[],
-            notable_services=[],
-            time_window="",
-            evidence_by_backend={},
-            covered_backends=[],
-            correlation=None,
+            phase=_DEFAULT_PHASE,
+            phase_history=[],
+            probes=[],
+            distinct_backends=[],
+            recent_probe_hashes=[],
             hypothesis=None,
-            verification=None,
-            recommendations=[],
             final_answer=None,
             investigation_summary=None,
             current_prompt="",
@@ -466,13 +439,7 @@ def build_application(tracking: bool = True):
 
 
 def build_server():
-    """Mount the o11y-fsm application as an MCP server.
-
-    Imports burrmcp lazily so that ``build_application`` (pure Burr) can be
-    used in environments where burrmcp isn't installed (e.g. the Harbor
-    agent runner drives the Application directly via ``astep`` and never
-    needs the MCP layer).
-    """
+    """Mount the o11y-fsm application as an MCP server (burrmcp lazy-imported)."""
     from burrmcp import ServingMode, mount
 
     return mount(
@@ -480,19 +447,18 @@ def build_server():
         mode=ServingMode.STEP,
         name="o11y-fsm",
         instructions=(
-            "Observability / SRE incident-investigation FSM. The CALLER LLM "
-            "(whoever is driving you through MCP) does the actual querying; "
-            "this FSM emits one prompt per phase and stores your findings. "
-            "Walk: start_investigation(incident_description, scenario_time=None) "
-            "-> survey_telemetry(available_backends, ...) "
-            "-> gather_evidence(backend, queries, ...) [loops; >=2 backends required] "
-            "-> correlate(impacted_services, time_window, evidence_summary) "
-            "-> form_hypothesis(primary_service, root_cause, ...) "
-            "-> verify_or_revise(verification_query, result_summary, confirmed, revised_root_cause='') "
-            "[disconfirmed -> loops back to form_hypothesis] "
-            "-> recommend_next_steps(recommendations, final_answer) [terminal]. "
-            "Read state.current_prompt after every step for the next phase's "
-            "instructions; burr://history for the full audit trail."
+            "Observability / SRE incident-investigation FSM, circe-style: "
+            "the query actions ARE the operations. Walk: "
+            "start_investigation(incident_description, scenario_time=None), "
+            "then query_metrics(promql) / query_logs(logql) / query_traces(traceql) "
+            "to gather evidence (each runs the query and records it), "
+            "advance_phase(to, rationale) to move triage->diagnose->verify, "
+            "and conclude(primary_service, root_cause, final_answer, cascade_services=[]) "
+            "to finish. conclude is gated: phase must be 'verify', you need probes "
+            "from >=2 distinct backends, and at least one probe during verify. "
+            "Repeated identical probes are refused (vary the probe). Read "
+            "state.current_prompt after each step; burr://history for the trail. "
+            "Requires a telemetry client bound (Grafana MCP in the Harbor runner)."
         ),
     )
 
