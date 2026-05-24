@@ -172,34 +172,40 @@ ADVANCE_WORKFLOW_TOOL_DEF = {
 }
 
 
-def call_advance_workflow(app: Any, action: str, inputs: dict[str, Any]) -> dict[str, Any]:
-    """Execute one FSM step in-process.
+def _valid_next_actions(app: Any) -> list[str]:
+    """Names of actions reachable from the current state.
 
-    Returns a dict with either the new state slice (success path) or a
-    structured error with `valid_next_actions` (refusal). The LLM gets
-    this back as its tool observation.
+    Mirrors burrmcp.adapter.valid_next_action_names: keys off Burr's
+    ``__PRIOR_STEP`` housekeeping value, then evaluates each outgoing
+    transition's condition against current state. Before any step has
+    run, the only legal action is the entrypoint.
     """
-    # Burr's "next action" mechanism: monkey-patch get_next_action like burrmcp does.
-    valid_now = [
-        t.to_action.name
-        for t in app.application_state.next_action_choices
-    ] if hasattr(app, "application_state") else []
-    # Compute valid next actions defensively from the graph.
-    try:
-        valid_now = sorted(
-            {t.to.name for t in app.graph.get_next_node_choices(app.state, app.action_choice_history)}
-        ) if hasattr(app.graph, "get_next_node_choices") else valid_now
-    except Exception:
-        pass
-    # Re-compute via internal API: get all transitions from current action whose conditions evaluate.
-    try:
-        current_action_name = (
-            app.current_action.name if app.current_action else "start_investigation"
-        )
-    except Exception:
-        current_action_name = "start_investigation"
+    from burr.core.action import Condition
 
-    legal = _legal_next_actions(app)
+    prior = app.state.get("__PRIOR_STEP")
+    if prior is None:
+        entry = app.graph.entrypoint
+        return [entry.name if hasattr(entry, "name") else str(entry)]
+    valid: list[str] = []
+    for t in app.graph.transitions:
+        if t.from_.name != prior:
+            continue
+        try:
+            if t.condition.run(app.state)[Condition.KEY]:
+                valid.append(t.to.name)
+        except Exception:
+            continue
+    return valid
+
+
+async def call_advance_workflow(app: Any, action: str, inputs: dict[str, Any]) -> dict[str, Any]:
+    """Execute one FSM step in-process (async; awaited from the agent loop).
+
+    Returns either the new state slice (success) or a structured refusal
+    with `valid_next_actions`. The LLM gets this back as its tool
+    observation, so refusals carry steering.
+    """
+    legal = _valid_next_actions(app)
     if action not in legal:
         return {
             "error": "invalid_transition",
@@ -210,69 +216,32 @@ def call_advance_workflow(app: Any, action: str, inputs: dict[str, Any]) -> dict
                 f"Reachable now: {legal}."
             ),
         }
-    # Use burrmcp's trick: monkey-patch get_next_action to return our chosen action.
-    return _step_named(app, action, inputs)
+    target = app.graph.get_action(action)
+    if target is None:
+        return {"error": "unknown_action", "requested": action, "valid_next_actions": legal}
 
-
-def _legal_next_actions(app: Any) -> list[str]:
-    """Compute the next legal actions from the current state by walking the
-    graph and evaluating each transition's condition."""
-    from burr.core.action import DEFAULT
-    state = app.state
-    # Figure out current action (or entrypoint if not yet started).
-    try:
-        current = app.current_action.name if app.current_action else app.graph.entrypoint
-    except Exception:
-        current = app.graph.entrypoint
-    legal: list[str] = []
-    for transition in app.graph.transitions:
-        if transition.from_.name != current:
-            continue
-        cond = transition.condition
-        if cond is None or cond.name == DEFAULT.name or _eval_condition(cond, state):
-            if transition.to.name not in legal:
-                legal.append(transition.to.name)
-    return legal
-
-
-def _eval_condition(condition: Any, state: Any) -> bool:
-    try:
-        result = condition.run(state)
-        if isinstance(result, dict):
-            return bool(result.get("PROCEED", False))
-        return bool(result)
-    except Exception:
-        return False
-
-
-def _step_named(app: Any, action_name: str, inputs: dict[str, Any]) -> dict[str, Any]:
-    """Drive one Burr step with the agent-chosen action."""
+    # Force Burr to run the agent-named action (same trick burrmcp uses):
+    # astep picks via get_next_action(); override it for this one call.
     original_get_next_action = app.get_next_action
+    app.get_next_action = lambda: target  # type: ignore[method-assign]
     try:
-        app.get_next_action = lambda: next(
-            a for a in app.graph.actions if a.name == action_name
-        )
-        # astep returns (action_run, result, state)
-        loop = asyncio.get_event_loop()
-        action_run, result, new_state = loop.run_until_complete(app.astep(inputs=inputs))
-        # Get refreshed legal next from the new state.
-        legal_next = _legal_next_actions(app)
-        # Trim state for the tool response: omit big internal fields.
-        state_view = {k: v for k, v in new_state.get_all().items() if not k.startswith("__")}
-        return {
-            "ok": True,
-            "action_executed": action_name,
-            "valid_next_actions": legal_next,
-            "state": state_view,
-        }
-    except Exception as e:
+        _a, _result, new_state = await app.astep(inputs=inputs)
+    except Exception as e:  # noqa: BLE001 — surface action-body errors as structured refusals
         return {
             "error": "action_error",
-            "requested": action_name,
+            "requested": action,
             "error_message": str(e),
         }
     finally:
-        app.get_next_action = original_get_next_action
+        app.get_next_action = original_get_next_action  # type: ignore[method-assign]
+
+    state_view = {k: v for k, v in new_state.get_all().items() if not k.startswith("__")}
+    return {
+        "ok": True,
+        "action_executed": action,
+        "valid_next_actions": _valid_next_actions(app),
+        "state": state_view,
+    }
 
 
 def fsm_terminated(app: Any) -> bool:
@@ -407,8 +376,8 @@ async def run_agent() -> None:
                                 inputs = json.loads(inputs)
                             except json.JSONDecodeError:
                                 inputs = {}
-                        obs = call_advance_workflow(fsm_app, action, inputs)
-                        print(f"FSM:{action}({obs.get('error','ok')})", end=" ", flush=True)
+                        obs = await call_advance_workflow(fsm_app, action, inputs)
+                        print(f"FSM:{action}({obs.get('error', 'ok')})", end=" ", flush=True)
                     else:
                         try:
                             obs_raw = await call_mcp_tool(session, fn, args)
