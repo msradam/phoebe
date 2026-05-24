@@ -3,10 +3,13 @@
 #   "apache-burr>=0.42,<0.43",
 #   "fastmcp>=3.3,<3.4",
 #   "pydantic>=2,<3",
-#   "litellm==1.83.10",
+#   "litellm>=1.84,<2",
 #   "mcp>=1.9.0",
 # ]
 # ///
+# litellm is >=1.84 (not the 1.83.10 the default o11y agent pins): fastmcp
+# requires python-dotenv>=1.1.0, which litellm 1.83.10 hard-pins to 1.0.1.
+# 1.84+ relaxes that, letting fastmcp + litellm coexist in one env.
 # Note: burrmcp is not on PyPI; its source is vendored into /app/burrmcp
 # by the Harbor agent's setup(). /app is on sys.path, so `import burrmcp`
 # resolves to the vendored copy.
