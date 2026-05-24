@@ -1,33 +1,28 @@
-"""o11y-fsm Burr Application: SRE incident investigation, circe-style.
+"""o11y-fsm Burr Application: SRE incident investigation via external_tools federation.
 
-Design (learned from circe, github project "madeline/circe"):
+Design (v0.3): the FSM does NOT proxy telemetry queries. It declares,
+per phase, which tools on the connected Grafana MCP server are relevant
+(via ``mount(external_tools=...)``), and records the findings the agent
+brings back. The agent calls Grafana's real tools natively (no bespoke
+proxy / arg-mapping in the FSM), reads ``next_external_tools`` off each
+step response, and ``step()``s here to record + advance.
 
-* **The operation IS the FSM action.** ``query_metrics`` / ``query_logs``
-  / ``query_traces`` actually run the telemetry query (through a bound
-  ``TelemetryClient``) and record the evidence in one step. There is no
-  separate "do work elsewhere, then report it" surface; that split is
-  what made the earlier v0.1 design loop weak models.
+This dogfoods burrmcp's external_tools feature in the flagship demo: the
+Burr graph is the conductor; Grafana's MCP server is the orchestra.
 
-* **Phase is a state variable, not a graph node.** ``phase`` moves
-  ``triage -> diagnose -> verify`` via ``advance_phase(to, rationale)``.
-  Operations and ``conclude`` consult it.
+Phases (state variable): triage -> diagnose -> verify.
 
-* **Hub topology + body-level gating.** Every operational action is
-  reachable from every other (broad reachability). The methodology is
-  enforced inside action bodies (``advance_phase`` requires probes;
-  ``conclude`` requires phase==verify + >=2 backends + a verifying probe),
-  not by narrowing graph reachability. The agent is never told "no" by
-  the graph for a normal operation; only by a body raising ValueError
-  with a specific, recoverable reason.
+Actions:
+  start_investigation(incident_description, scenario_time)
+  record_finding(backend, query, result_summary, hypothesis)   [loops]
+  advance_phase(to, rationale)
+  conclude(primary_service, root_cause, final_answer, cascade_services)
 
-* **Loop guard.** The same ``(backend, query)`` within a short window is
-  refused ("vary the probe"), so a weak model can't burn its budget
-  re-running one query.
-
-The query actions reach the backend through ``telemetry.get_telemetry_client``;
-bind one with ``telemetry.bind_telemetry_client(...)`` before stepping
-(the Harbor runner binds a Grafana-MCP-backed client; tests bind a
-``MockTelemetryClient``).
+Gating (in action bodies, circe-style; see [[fsm-single-surface-lesson]]):
+  - advance_phase to diagnose: >=1 finding.
+  - advance_phase to verify: findings from >=2 distinct backends.
+  - conclude: phase==verify, >=2 backends, >=1 finding recorded during verify.
+  - loop guard: same (backend, query) within a short window is refused.
 """
 
 from __future__ import annotations
@@ -39,7 +34,6 @@ from burr.core import ApplicationBuilder, State, action
 from burr.core.action import Condition
 
 from o11y_fsm import prompts
-from o11y_fsm.telemetry import require_telemetry_client
 
 _TRACKER_PROJECT = "o11y-fsm"
 
@@ -57,6 +51,24 @@ _BACKEND_ALIASES = {
 _LOOP_GUARD_WINDOW = 4
 _MIN_BACKENDS_TO_CONCLUDE = 2
 
+# Which Grafana MCP tools are relevant per phase. Surfaced via
+# mount(external_tools=...) as next_external_tools on each step response.
+# Soft guidance: the agent has the full Grafana tool surface available;
+# these scope its choice to what matters for the reachable actions.
+EXTERNAL_TOOLS = {
+    "start_investigation": ["list_datasources", "list_prometheus_metric_names"],
+    "record_finding": [
+        "query_prometheus",
+        "query_loki_logs",
+        "query_loki_stats",
+        "list_loki_label_names",
+        "query_tempo_traces",
+        "list_prometheus_metric_names",
+        "list_prometheus_label_names",
+    ],
+    "conclude": ["query_prometheus", "query_loki_logs"],
+}
+
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
@@ -66,71 +78,8 @@ def _probe_hash(backend: str, query: str) -> str:
     return f"{backend}::{query.strip()}"
 
 
-def _distinct_backends(probes: list[dict[str, Any]]) -> set[str]:
-    return {p["backend"] for p in probes if p.get("backend")}
-
-
-async def _run_probe(
-    state: State[Any],
-    *,
-    backend: str,
-    query: str,
-    hypothesis: str | None,
-) -> State[Any]:
-    """Shared body for the three query_* actions.
-
-    Executes the query through the bound telemetry client, records the
-    probe (with the phase it ran in, so post-verify verification probes
-    can be counted), and enforces the loop guard.
-    """
-    query = (query or "").strip()
-    if not query:
-        raise ValueError("query must not be empty")
-    backend = _BACKEND_ALIASES.get((backend or "").strip().lower(), (backend or "").strip().lower())
-
-    recent = state.get("recent_probe_hashes") or []
-    h = _probe_hash(backend, query)
-    if h in recent[-_LOOP_GUARD_WINDOW:]:
-        raise ValueError(
-            f"loop guard: this exact {backend} query ran within the last "
-            f"{_LOOP_GUARD_WINDOW} probes. Vary the probe (different query, "
-            f"different backend) or, if you have enough evidence, "
-            f"advance_phase / conclude."
-        )
-
-    client = require_telemetry_client()
-    result = await client.query(backend, query)
-    ok = bool(result.get("ok", True))
-    summary = str(result.get("summary", "")).strip() or "(no summary)"
-
-    phase = state.get("phase") or _DEFAULT_PHASE
-    probe = {
-        "backend": backend,
-        "query": query,
-        "ok": ok,
-        "summary": summary,
-        "hypothesis": (hypothesis or "").strip(),
-        "phase": phase,
-        "ts": _now(),
-    }
-    probes = [*(state.get("probes") or []), probe]
-    distinct = sorted(_distinct_backends(probes))
-    next_recent = [*recent, h][-(_LOOP_GUARD_WINDOW * 2) :]
-
-    prompt = prompts.after_probe(
-        backend=backend,
-        summary=summary,
-        phase=phase,
-        distinct_backends=distinct,
-        n_probes=len(probes),
-    )
-    return state.update(
-        probes=probes,
-        distinct_backends=distinct,
-        recent_probe_hashes=next_recent,
-        current_prompt=prompt,
-        log=[*state["log"], f"probe {backend}: {summary[:60]}"],
-    )
+def _distinct_backends(findings: list[dict[str, Any]]) -> set[str]:
+    return {f["backend"] for f in findings if f.get("backend")}
 
 
 # == actions ==========================================================
@@ -143,7 +92,7 @@ async def _run_probe(
         "scenario_time",
         "phase",
         "phase_history",
-        "probes",
+        "findings",
         "distinct_backends",
         "recent_probe_hashes",
         "hypothesis",
@@ -172,7 +121,7 @@ async def start_investigation(
         scenario_time=scenario_time,
         phase=_DEFAULT_PHASE,
         phase_history=[],
-        probes=[],
+        findings=[],
         distinct_backends=[],
         recent_probe_hashes=[],
         hypothesis=None,
@@ -184,67 +133,86 @@ async def start_investigation(
 
 
 @action(
-    reads=["phase", "probes", "distinct_backends", "recent_probe_hashes", "log"],
-    writes=["probes", "distinct_backends", "recent_probe_hashes", "current_prompt", "log"],
+    reads=["phase", "findings", "distinct_backends", "recent_probe_hashes", "log"],
+    writes=["findings", "distinct_backends", "recent_probe_hashes", "current_prompt", "log"],
 )
-async def query_metrics(
-    state: State[Any], promql: str, hypothesis: str | None = None
+async def record_finding(
+    state: State[Any],
+    backend: str,
+    query: str,
+    result_summary: str,
+    hypothesis: str | None = None,
 ) -> State[Any]:
-    """Run a Prometheus (metrics) query and record the evidence.
+    """Record one finding from a Grafana query the agent already ran.
+
+    Call this AFTER using a Grafana MCP tool (query_prometheus,
+    query_loki_logs, query_tempo_traces, ...) named in next_external_tools.
+    The FSM does not run the query; it records what you found and gates
+    progression on the evidence.
 
     Args:
-        promql: the PromQL query string.
-        hypothesis: optional short reason for this probe.
+        backend: which backend the query hit ("prometheus" / "loki" /
+            "tempo"; metrics/logs/traces aliases accepted).
+        query: the query string you ran.
+        result_summary: 1-3 sentences on what the result showed.
+        hypothesis: optional short reason this probe mattered.
     """
-    return await _run_probe(state, backend="prometheus", query=promql, hypothesis=hypothesis)
+    query = (query or "").strip()
+    if not query:
+        raise ValueError("query must not be empty")
+    if len(result_summary.strip()) < 10:
+        raise ValueError(
+            "result_summary too thin; summarize what the Grafana query actually returned."
+        )
+    backend = _BACKEND_ALIASES.get((backend or "").strip().lower(), (backend or "").strip().lower())
+    if not backend:
+        raise ValueError("backend must be a non-empty backend name")
+
+    recent = state.get("recent_probe_hashes") or []
+    h = _probe_hash(backend, query)
+    if h in recent[-_LOOP_GUARD_WINDOW:]:
+        raise ValueError(
+            f"loop guard: this exact {backend} query was already recorded within "
+            f"the last {_LOOP_GUARD_WINDOW} findings. Vary the query / backend, "
+            f"or advance_phase / conclude if you have enough evidence."
+        )
+
+    phase = state.get("phase") or _DEFAULT_PHASE
+    finding = {
+        "backend": backend,
+        "query": query,
+        "result_summary": result_summary.strip(),
+        "hypothesis": (hypothesis or "").strip(),
+        "phase": phase,
+        "ts": _now(),
+    }
+    findings = [*(state.get("findings") or []), finding]
+    distinct = sorted(_distinct_backends(findings))
+    next_recent = [*recent, h][-(_LOOP_GUARD_WINDOW * 2) :]
+    return state.update(
+        findings=findings,
+        distinct_backends=distinct,
+        recent_probe_hashes=next_recent,
+        current_prompt=prompts.after_probe(
+            backend=backend,
+            summary=result_summary.strip(),
+            phase=phase,
+            distinct_backends=distinct,
+            n_probes=len(findings),
+        ),
+        log=[*state["log"], f"finding {backend}: {result_summary.strip()[:60]}"],
+    )
 
 
 @action(
-    reads=["phase", "probes", "distinct_backends", "recent_probe_hashes", "log"],
-    writes=["probes", "distinct_backends", "recent_probe_hashes", "current_prompt", "log"],
-)
-async def query_logs(state: State[Any], logql: str, hypothesis: str | None = None) -> State[Any]:
-    """Run a Loki (logs) query and record the evidence.
-
-    Args:
-        logql: the LogQL query string.
-        hypothesis: optional short reason for this probe.
-    """
-    return await _run_probe(state, backend="loki", query=logql, hypothesis=hypothesis)
-
-
-@action(
-    reads=["phase", "probes", "distinct_backends", "recent_probe_hashes", "log"],
-    writes=["probes", "distinct_backends", "recent_probe_hashes", "current_prompt", "log"],
-)
-async def query_traces(
-    state: State[Any], traceql: str, hypothesis: str | None = None
-) -> State[Any]:
-    """Run a Tempo (traces) query and record the evidence.
-
-    Args:
-        traceql: the TraceQL query string.
-        hypothesis: optional short reason for this probe.
-    """
-    return await _run_probe(state, backend="tempo", query=traceql, hypothesis=hypothesis)
-
-
-@action(
-    reads=["phase", "phase_history", "probes", "distinct_backends", "log"],
+    reads=["phase", "phase_history", "findings", "distinct_backends", "log"],
     writes=["phase", "phase_history", "current_prompt", "log"],
 )
 async def advance_phase(state: State[Any], to: str, rationale: str) -> State[Any]:
-    """Advance the investigation phase. Gated on evidence.
+    """Advance the investigation phase: triage -> diagnose -> verify.
 
-    Phases:
-      - ``triage``   initial context gathering (default).
-      - ``diagnose`` working a hypothesis; needs >=1 probe.
-      - ``verify``   confirming the leading hypothesis; needs probes from
-        >=2 distinct backends (you can't conclude a cross-cutting incident
-        from a single signal).
-
-    The hard gate for the final answer lives on ``conclude``; this action
-    just enforces that you don't skip the investigation the phase implies.
+    Gated: to='diagnose' needs >=1 finding; to='verify' needs findings
+    from >=2 distinct backends.
     """
     to = (to or "").strip().lower()
     if to not in _PHASES:
@@ -252,19 +220,18 @@ async def advance_phase(state: State[Any], to: str, rationale: str) -> State[Any
     if not rationale.strip():
         raise ValueError("advance_phase requires a non-empty rationale")
 
-    probes = state.get("probes") or []
-    distinct = _distinct_backends(probes)
-    if to == "diagnose" and len(probes) < 1:
+    findings = state.get("findings") or []
+    distinct = _distinct_backends(findings)
+    if to == "diagnose" and len(findings) < 1:
         raise ValueError(
-            "advance_phase(to='diagnose') requires at least 1 probe first. "
-            "Run a query_metrics / query_logs / query_traces to gather evidence."
+            "advance_phase(to='diagnose') requires at least 1 finding first. "
+            "Use a Grafana tool then record_finding."
         )
     if to == "verify" and len(distinct) < _MIN_BACKENDS_TO_CONCLUDE:
         raise ValueError(
-            f"advance_phase(to='verify') requires probes from at least "
+            f"advance_phase(to='verify') requires findings from at least "
             f"{_MIN_BACKENDS_TO_CONCLUDE} distinct backends; you have "
-            f"{sorted(distinct)}. Cross-reference at least one more backend "
-            f"(e.g. logs if you've only queried metrics) before verifying."
+            f"{sorted(distinct)}. Cross-reference another backend first."
         )
 
     prev = state.get("phase") or _DEFAULT_PHASE
@@ -275,19 +242,13 @@ async def advance_phase(state: State[Any], to: str, rationale: str) -> State[Any
     return state.update(
         phase=to,
         phase_history=history,
-        current_prompt=prompts.after_advance(to, sorted(distinct), len(probes)),
+        current_prompt=prompts.after_advance(to, sorted(distinct), len(findings)),
         log=[*state["log"], f"phase {prev} -> {to}: {rationale.strip()[:60]}"],
     )
 
 
 @action(
-    reads=[
-        "incident_description",
-        "phase",
-        "probes",
-        "distinct_backends",
-        "log",
-    ],
+    reads=["incident_description", "phase", "findings", "distinct_backends", "log"],
     writes=["hypothesis", "final_answer", "investigation_summary", "current_prompt", "log"],
 )
 async def conclude(
@@ -299,11 +260,8 @@ async def conclude(
 ) -> State[Any]:
     """Terminal. Commit the conclusion + final answer. Gated.
 
-    Requires:
-      - phase == ``verify`` (you advanced through the methodology),
-      - probes from >= 2 distinct backends,
-      - at least one probe taken DURING the verify phase (the verification
-        step: you confirmed the leading hypothesis, not just asserted it).
+    Requires phase=='verify', findings from >=2 distinct backends, and at
+    least one finding recorded during the verify phase.
 
     Args:
         primary_service: the single service judged the root cause
@@ -316,22 +274,22 @@ async def conclude(
     if phase != "verify":
         raise ValueError(
             f"conclude requires phase=='verify'; current phase is {phase!r}. "
-            "Call advance_phase(to='verify', rationale=...) once you have "
+            "advance_phase(to='verify', rationale=...) once you have "
             "cross-referenced evidence and a leading hypothesis."
         )
-    probes = state.get("probes") or []
-    distinct = _distinct_backends(probes)
+    findings = state.get("findings") or []
+    distinct = _distinct_backends(findings)
     if len(distinct) < _MIN_BACKENDS_TO_CONCLUDE:
         raise ValueError(
-            f"conclude requires probes from >= {_MIN_BACKENDS_TO_CONCLUDE} distinct "
+            f"conclude requires findings from >= {_MIN_BACKENDS_TO_CONCLUDE} distinct "
             f"backends; you have {sorted(distinct)}."
         )
-    verify_probes = [p for p in probes if p.get("phase") == "verify"]
-    if not verify_probes:
+    verify_findings = [f for f in findings if f.get("phase") == "verify"]
+    if not verify_findings:
         raise ValueError(
-            "conclude requires at least one probe taken during the verify phase. "
-            "Run a focused query that confirms (or refutes) your leading "
-            "hypothesis, then conclude."
+            "conclude requires at least one finding recorded during the verify "
+            "phase. Run a focused Grafana query that confirms (or refutes) your "
+            "leading hypothesis, record_finding it, then conclude."
         )
     primary = (primary_service or "").strip()
     if not primary:
@@ -355,8 +313,8 @@ async def conclude(
         "cascade_services": hypothesis["cascade_services"],
         "root_cause": hypothesis["root_cause"],
         "distinct_backends": sorted(distinct),
-        "n_probes": len(probes),
-        "n_verify_probes": len(verify_probes),
+        "n_findings": len(findings),
+        "n_verify_findings": len(verify_findings),
         "final_answer_chars": len(final_answer),
     }
     return state.update(
@@ -364,20 +322,13 @@ async def conclude(
         final_answer=final_answer.strip(),
         investigation_summary=summary,
         current_prompt="Investigation complete. Final answer in state.final_answer.",
-        log=[*state["log"], f"concluded: primary={primary!r}; {len(probes)} probe(s)"],
+        log=[*state["log"], f"concluded: primary={primary!r}; {len(findings)} finding(s)"],
     )
 
 
 # == graph (hub topology) =============================================
 
-_HUB = ("query_metrics", "query_logs", "query_traces", "advance_phase", "conclude")
-
-# Every transition carries an explicit condition. Burr only rejects
-# multiple *unconditional* (default) transitions from one source; giving
-# each an explicit condition makes the hub legal. ``_OPEN`` is true while
-# the investigation hasn't concluded, so all hub actions are reachable
-# until conclude sets final_answer (after which nothing is, => terminal).
-# Methodology gating lives in the action bodies, not here (circe-style).
+_HUB = ("record_finding", "advance_phase", "conclude")
 _OPEN = Condition.expr("final_answer is None")
 
 
@@ -397,18 +348,16 @@ def build_application(tracking: bool = True):
     """Build the o11y-fsm Burr Application.
 
     Args:
-        tracking: wire a ``LocalTrackingClient`` for Burr UI + ``burrmcp
-            sessions`` visibility. Default True. Set False in minimal
-            environments (the Harbor container has no compiler for
-            psutil, pulled transitively by the tracking extra).
+        tracking: wire a LocalTrackingClient for Burr UI + burrmcp sessions
+            visibility. Default True; set False in minimal environments
+            (the Harbor container lacks a compiler for the tracking extra's
+            transitive psutil).
     """
     builder = (
         ApplicationBuilder()
         .with_actions(
             start_investigation=start_investigation,
-            query_metrics=query_metrics,
-            query_logs=query_logs,
-            query_traces=query_traces,
+            record_finding=record_finding,
             advance_phase=advance_phase,
             conclude=conclude,
         )
@@ -424,7 +373,7 @@ def build_application(tracking: bool = True):
             scenario_time="",
             phase=_DEFAULT_PHASE,
             phase_history=[],
-            probes=[],
+            findings=[],
             distinct_backends=[],
             recent_probe_hashes=[],
             hypothesis=None,
@@ -439,26 +388,26 @@ def build_application(tracking: bool = True):
 
 
 def build_server():
-    """Mount the o11y-fsm application as an MCP server (burrmcp lazy-imported)."""
+    """Mount o11y-fsm as an MCP server, declaring Grafana tools per phase."""
     from burrmcp import ServingMode, mount
 
     return mount(
         build_application,
         mode=ServingMode.STEP,
         name="o11y-fsm",
+        external_tools=EXTERNAL_TOOLS,
         instructions=(
-            "Observability / SRE incident-investigation FSM, circe-style: "
-            "the query actions ARE the operations. Walk: "
-            "start_investigation(incident_description, scenario_time=None), "
-            "then query_metrics(promql) / query_logs(logql) / query_traces(traceql) "
-            "to gather evidence (each runs the query and records it), "
-            "advance_phase(to, rationale) to move triage->diagnose->verify, "
-            "and conclude(primary_service, root_cause, final_answer, cascade_services=[]) "
-            "to finish. conclude is gated: phase must be 'verify', you need probes "
-            "from >=2 distinct backends, and at least one probe during verify. "
-            "Repeated identical probes are refused (vary the probe). Read "
-            "state.current_prompt after each step; burr://history for the trail. "
-            "Requires a telemetry client bound (Grafana MCP in the Harbor runner)."
+            "Observability / SRE incident-investigation FSM. This server holds "
+            "no telemetry tools; it orchestrates the connected Grafana MCP "
+            "server. Each step response carries next_external_tools naming the "
+            "Grafana tools relevant for the reachable actions. Walk: "
+            "start_investigation(incident_description, scenario_time=None) -> "
+            "[call a Grafana tool, then record_finding(backend, query, "
+            "result_summary)] looped across >=2 backends -> "
+            "advance_phase(to, rationale) triage->diagnose->verify -> "
+            "conclude(primary_service, root_cause, final_answer, cascade_services). "
+            "conclude is gated: phase=='verify', >=2 backends, and a finding "
+            "recorded during verify. Read state.current_prompt after each step."
         ),
     )
 

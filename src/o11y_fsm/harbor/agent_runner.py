@@ -6,18 +6,19 @@
 #   "mcp>=1.9.0",
 # ]
 # ///
-"""o11y-fsm agent runner (v0.2, circe-style) — runs inside the Harbor container.
+"""o11y-fsm agent runner (v0.3, external_tools federation) — runs in the Harbor container.
 
-Single tool surface: the LLM sees ONLY the o11y-fsm actions
-(start_investigation, query_metrics, query_logs, query_traces,
-advance_phase, conclude). It does NOT see the raw Grafana MCP tools.
-The FSM's query actions own the telemetry: they call a
-GrafanaMCPTelemetryClient (bound on o11y_fsm.telemetry's ContextVar)
-that proxies to the Grafana MCP session under the hood.
+The agent sees BOTH surfaces:
+  - the o11y-fsm actions (start_investigation, record_finding,
+    advance_phase, conclude) — driven via in-process FSM steps;
+  - the Grafana MCP tools (query_prometheus, query_loki_logs, ...) —
+    passed through to the Grafana MCP session.
 
-This is the fix for the two-surface problem: a weak model can't get
-absorbed in raw queries and forget to drive the FSM, because the only
-way to query telemetry is *through* an FSM action.
+The FSM does not proxy queries. It declares which Grafana tools are
+relevant per phase (mount(external_tools=...)); each FSM step response
+carries next_external_tools telling the agent which Grafana tools to
+call next. The agent calls them natively, then record_finding's the
+result. The Burr graph conducts; the Grafana server executes.
 """
 
 from __future__ import annotations
@@ -34,9 +35,6 @@ from typing import Any, cast
 sys.path.insert(0, "/app")
 
 from o11y_fsm import build_application  # noqa: E402
-from o11y_fsm.telemetry import bind_telemetry_client  # noqa: E402
-
-# == helpers =========================================================
 
 
 def scenario_clock_iso() -> str:
@@ -62,89 +60,31 @@ def parse_tool_arguments(arguments: Any) -> dict[str, Any]:
     return {"_raw": str(arguments)}
 
 
-# == Grafana MCP-backed telemetry client =============================
+def relax_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Collapse anyOf-of-string-or-null property types some MCP tools use,
+    which not every provider round-trips cleanly."""
+    import copy
+
+    out = copy.deepcopy(schema or {})
+
+    def _walk(node: Any) -> None:
+        if isinstance(node, dict):
+            if "anyOf" in node and "type" not in node:
+                non_null = [b for b in node["anyOf"] if b.get("type") != "null"]
+                if non_null:
+                    node.clear()
+                    node.update(non_null[0])
+            for v in node.values():
+                _walk(v)
+        elif isinstance(node, list):
+            for it in node:
+                _walk(it)
+
+    _walk(out)
+    return out
 
 
-class GrafanaMCPTelemetryClient:
-    """Implements o11y_fsm.telemetry.TelemetryClient by proxying to the
-    Grafana MCP session. Resolves the right query tool per backend by
-    name-matching the discovered tools, and fills the query into the
-    tool's most likely query argument.
-    """
-
-    _BACKEND_KEYWORDS = {
-        "prometheus": ("prometheus", "promql", "metric"),
-        "loki": ("loki", "logql", "log"),
-        "tempo": ("tempo", "trace"),
-    }
-    _QUERY_ARG_CANDIDATES = ("expr", "query", "promql", "logql", "traceql", "q", "logQL", "promQL")
-
-    def __init__(self, session: Any, tools: list[dict[str, Any]]):
-        self._session = session
-        self._tools = tools  # list of {"name", "description", "parameters"}
-        self._by_backend: dict[str, dict[str, Any]] = {}
-        for backend, keywords in self._BACKEND_KEYWORDS.items():
-            tool = self._find_tool(keywords)
-            if tool:
-                self._by_backend[backend] = tool
-
-    def _find_tool(self, keywords: tuple[str, ...]) -> dict[str, Any] | None:
-        # Prefer a tool whose name contains a keyword AND looks like a query.
-        named = [t for t in self._tools if any(k in t["name"].lower() for k in keywords)]
-        for t in named:
-            if "quer" in t["name"].lower():
-                return t
-        return named[0] if named else None
-
-    def _query_arg(self, tool: dict[str, Any]) -> str:
-        props = (tool.get("parameters") or {}).get("properties") or {}
-        for cand in self._QUERY_ARG_CANDIDATES:
-            if cand in props:
-                return cand
-        # last resort: first string property
-        for name, spec in props.items():
-            if spec.get("type") == "string":
-                return name
-        return "query"
-
-    async def query(self, backend: str, query: str, **kwargs: Any) -> dict[str, Any]:
-        tool = self._by_backend.get(backend)
-        if tool is None:
-            return {
-                "ok": False,
-                "backend": backend,
-                "summary": f"no Grafana MCP tool resolved for backend {backend!r}; "
-                f"available backends: {sorted(self._by_backend)}",
-            }
-        arg = self._query_arg(tool)
-        try:
-            res = await self._session.call_tool(tool["name"], {arg: query})
-        except Exception as e:  # noqa: BLE001
-            return {"ok": False, "backend": backend, "summary": f"query error: {e}"}
-        text = self._extract_text(res)
-        return {
-            "ok": True,
-            "backend": backend,
-            "tool": tool["name"],
-            "summary": text[:600] if text else "(empty result)",
-            "raw": text[:4000],
-        }
-
-    @staticmethod
-    def _extract_text(res: Any) -> str:
-        if getattr(res, "structured_content", None) is not None:
-            return json.dumps(res.structured_content, default=str)
-        if getattr(res, "content", None):
-            parts = [getattr(c, "text", "") for c in res.content if getattr(c, "text", "")]
-            if parts:
-                return "\n".join(parts)
-        return ""
-
-    async def list_datasources(self) -> list[dict[str, Any]]:
-        return [{"name": b, "type": b} for b in self._by_backend]
-
-
-# == FSM actions exposed as LLM tools ================================
+# == FSM actions as LLM tools ========================================
 
 FSM_TOOLS: list[dict[str, Any]] = [
     {
@@ -165,48 +105,21 @@ FSM_TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "query_metrics",
-            "description": "Run a Prometheus/PromQL query and record the evidence.",
+            "name": "record_finding",
+            "description": (
+                "Record a finding from a Grafana query you ALREADY ran. Call a "
+                "Grafana tool first (see next_external_tools), then record what "
+                "it showed here. The FSM gates progression on the evidence."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "promql": {"type": "string"},
-                    "hypothesis": {
-                        "type": "string",
-                        "description": "Optional reason for this probe.",
-                    },
-                },
-                "required": ["promql"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "query_logs",
-            "description": "Run a Loki/LogQL query and record the evidence.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "logql": {"type": "string"},
+                    "backend": {"type": "string", "description": "prometheus | loki | tempo"},
+                    "query": {"type": "string"},
+                    "result_summary": {"type": "string"},
                     "hypothesis": {"type": "string"},
                 },
-                "required": ["logql"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "query_traces",
-            "description": "Run a Tempo/TraceQL query and record the evidence.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "traceql": {"type": "string"},
-                    "hypothesis": {"type": "string"},
-                },
-                "required": ["traceql"],
+                "required": ["backend", "query", "result_summary"],
             },
         },
     },
@@ -215,9 +128,8 @@ FSM_TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "advance_phase",
             "description": (
-                "Advance the investigation phase: triage -> diagnose -> verify. "
-                "to='diagnose' needs >=1 probe; to='verify' needs probes from "
-                ">=2 distinct backends."
+                "Advance triage -> diagnose -> verify. to='diagnose' needs >=1 "
+                "finding; to='verify' needs findings from >=2 distinct backends."
             ),
             "parameters": {
                 "type": "object",
@@ -234,9 +146,8 @@ FSM_TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "conclude",
             "description": (
-                "Finish the investigation with the conclusion + final answer. "
-                "Requires phase=='verify', probes from >=2 backends, and a probe "
-                "taken during the verify phase."
+                "Finish with the conclusion + final answer. Requires phase=='verify', "
+                "findings from >=2 backends, and a finding recorded during verify."
             ),
             "parameters": {
                 "type": "object",
@@ -273,6 +184,16 @@ def _valid_next_actions(app: Any) -> list[str]:
     return valid
 
 
+# external_tools map, mirrored from o11y_fsm.app so the runner can surface
+# next_external_tools in the FSM step observation (the in-process FSM
+# doesn't go through burrmcp.mount, so we attach it here).
+from o11y_fsm.app import EXTERNAL_TOOLS  # noqa: E402
+
+
+def _next_external_tools(valid: list[str]) -> dict[str, list[str]]:
+    return {a: EXTERNAL_TOOLS[a] for a in valid if EXTERNAL_TOOLS.get(a)}
+
+
 async def step_fsm(app: Any, action: str, inputs: dict[str, Any]) -> dict[str, Any]:
     legal = _valid_next_actions(app)
     if action not in legal:
@@ -280,6 +201,7 @@ async def step_fsm(app: Any, action: str, inputs: dict[str, Any]) -> dict[str, A
             "error": "invalid_transition",
             "requested": action,
             "valid_next_actions": legal,
+            "next_external_tools": _next_external_tools(legal),
             "message": f"action {action!r} not reachable now. Reachable: {legal}.",
         }
     target = app.graph.get_action(action)
@@ -294,19 +216,19 @@ async def step_fsm(app: Any, action: str, inputs: dict[str, Any]) -> dict[str, A
     finally:
         app.get_next_action = original  # type: ignore[method-assign]
     sv = {k: v for k, v in new_state.get_all().items() if not k.startswith("__")}
-    # Keep the observation compact: drop bulky probe payloads, keep counts + prompt.
-    compact = {
-        "phase": sv.get("phase"),
-        "distinct_backends": sv.get("distinct_backends"),
-        "n_probes": len(sv.get("probes") or []),
-        "current_prompt": sv.get("current_prompt"),
-        "final_answer_set": sv.get("final_answer") is not None,
-    }
+    valid = _valid_next_actions(app)
     return {
         "ok": True,
         "action_executed": action,
-        "valid_next_actions": _valid_next_actions(app),
-        "state": compact,
+        "valid_next_actions": valid,
+        "next_external_tools": _next_external_tools(valid),
+        "state": {
+            "phase": sv.get("phase"),
+            "distinct_backends": sv.get("distinct_backends"),
+            "n_findings": len(sv.get("findings") or []),
+            "current_prompt": sv.get("current_prompt"),
+            "final_answer_set": sv.get("final_answer") is not None,
+        },
     }
 
 
@@ -317,7 +239,15 @@ def fsm_terminated(app: Any) -> bool:
         return False
 
 
-# == main loop =======================================================
+def _extract_text(res: Any) -> str:
+    if getattr(res, "structured_content", None) is not None:
+        return json.dumps(res.structured_content, default=str)
+    if getattr(res, "content", None):
+        parts = [getattr(c, "text", "") for c in res.content if getattr(c, "text", "")]
+        if parts:
+            return "\n".join(parts)
+    return ""
+
 
 SYSTEM_PROMPT = Path("/app/system_prompt.txt").read_text(encoding="utf-8")
 TASK_PROMPT_TEMPLATE = Path("/app/task_prompt.txt").read_text(encoding="utf-8")
@@ -353,20 +283,22 @@ async def run_agent() -> None:
             listed = await session.list_tools()
             grafana_tools = [
                 {
-                    "name": t.name,
-                    "description": (t.description or ""),
-                    "parameters": t.inputSchema or {},
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": (t.description or "").strip()[:1024],
+                        "parameters": relax_schema(t.inputSchema or {}),
+                    },
                 }
                 for t in listed.tools
             ]
+            grafana_names = {t["function"]["name"] for t in grafana_tools}
             print(
-                f"Discovered {len(grafana_tools)} Grafana MCP tools (proxied; not exposed to LLM)"
+                f"Discovered {len(grafana_tools)} Grafana tools; exposing them "
+                f"alongside {len(FSM_TOOLS)} FSM tools (federation)."
             )
 
-            # Bind the telemetry client so the FSM query actions reach Grafana.
-            client = GrafanaMCPTelemetryClient(session, grafana_tools)
-            print(f"Telemetry backends resolved: {sorted(client._by_backend)}")
-            bind_telemetry_client(client)
+            tools_for_llm = FSM_TOOLS + grafana_tools
 
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -378,7 +310,7 @@ async def run_agent() -> None:
                 step += 1
                 print(f"[{step}]", end=" ", flush=True)
                 resp = await litellm.acompletion(
-                    model=model, messages=messages, tools=FSM_TOOLS, tool_choice="auto"
+                    model=model, messages=messages, tools=tools_for_llm, tool_choice="auto"
                 )
                 msg = cast(Any, resp).choices[0].message
                 tool_calls = msg.tool_calls or []
@@ -405,13 +337,20 @@ async def run_agent() -> None:
                     args = parse_tool_arguments(tc.function.arguments)
                     if fn in _FSM_ACTION_NAMES:
                         obs = await step_fsm(fsm_app, fn, args)
-                        print(f"{fn}({obs.get('error', 'ok')})", end=" ", flush=True)
+                        tag = obs.get("error", "ok")
+                    elif fn in grafana_names:
+                        try:
+                            res = await session.call_tool(fn, args)
+                            text = _extract_text(res)
+                            obs = {"ok": True, "tool": fn, "result": text[:5000]}
+                            tag = "grafana"
+                        except Exception as e:  # noqa: BLE001
+                            obs = {"error": "grafana_tool_error", "tool": fn, "message": str(e)}
+                            tag = "grafana_err"
                     else:
-                        obs = {
-                            "error": "unknown_tool",
-                            "message": f"{fn} is not an o11y-fsm action",
-                        }
-                        print(f"?{fn}", end=" ", flush=True)
+                        obs = {"error": "unknown_tool", "tool": fn}
+                        tag = "unknown"
+                    print(f"{fn}({tag})", end=" ", flush=True)
                     messages.append(
                         {
                             "role": "tool",
@@ -419,14 +358,7 @@ async def run_agent() -> None:
                             "content": json.dumps(obs, default=str),
                         }
                     )
-                steps_log.append(
-                    {
-                        "step": step,
-                        "type": "tools",
-                        "calls": [tc.function.name for tc in tool_calls],
-                    }
-                )
-
+                steps_log.append({"step": step, "calls": [tc.function.name for tc in tool_calls]})
                 if fsm_terminated(fsm_app):
                     print("FSM terminated")
                     break
@@ -447,7 +379,7 @@ async def run_agent() -> None:
     traj = {
         "schema_version": "ATIF-v1.7",
         "session_id": str(uuid.uuid4()),
-        "agent": {"name": "o11y-fsm", "version": "0.2.0", "model_name": model},
+        "agent": {"name": "o11y-fsm", "version": "0.3.0", "model_name": model},
         "steps": steps_log,
         "final_metrics": {
             "total_prompt_tokens": stats["input"],

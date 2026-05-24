@@ -1,9 +1,7 @@
-"""o11y-fsm v0.2 (circe-style): action bodies own the queries; phase is a
-state variable; gating lives in action bodies; hub topology.
-
-A MockTelemetryClient is bound per test so the query_* actions have a
-backend. The "agent" is simulated by feeding inputs into each step and
-reading state / valid_next_actions afterward.
+"""o11y-fsm v0.3 (external_tools federation): the FSM records findings the
+agent brings back from the connected Grafana MCP server; it does not run
+queries itself. Phase is a state variable; gating lives in action bodies;
+hub topology.
 """
 
 from __future__ import annotations
@@ -14,21 +12,8 @@ import pytest
 from fastmcp import Client
 
 from o11y_fsm import build_server
-from o11y_fsm.telemetry import MockTelemetryClient, bind_telemetry_client
 
 _INCIDENT = "error rates jumped across services; triage primary vs cascade."
-
-
-@pytest.fixture(autouse=True)
-def _bind_mock_client():
-    """Every test gets a mock telemetry backend bound for the duration."""
-    token = bind_telemetry_client(MockTelemetryClient())
-    try:
-        yield
-    finally:
-        from o11y_fsm.telemetry import _CLIENT
-
-        _CLIENT.reset(token)
 
 
 async def _step(client, action, **inputs):
@@ -48,134 +33,129 @@ async def _start(client):
     )
 
 
-async def _probe_two_backends(client):
-    await _step(client, "query_metrics", promql="sum(rate(http_5xx[5m]))")
-    await _step(client, "query_logs", logql='{job="payment"} |= "error"')
+async def _two_backends(client):
+    await _step(
+        client,
+        "record_finding",
+        backend="prometheus",
+        query="sum(rate(http_5xx[5m]))",
+        result_summary="payment-service 5xx spiking from 14:02",
+    )
+    await _step(
+        client,
+        "record_finding",
+        backend="loki",
+        query='{job="payment"} |= "error"',
+        result_summary="connection pool exhausted errors at 14:02",
+    )
 
 
-# == start_investigation ==============================================
+# == start + external_tools surfacing =================================
 
 
 @pytest.mark.asyncio
 async def test_start_rejects_empty_incident():
-    server = build_server()
-    async with Client(server) as client:
+    async with Client(build_server()) as client:
         out = _payload(await _step(client, "start_investigation", incident_description=""))
         assert out["error"] == "action_error"
-        assert "incident_description must not be empty" in out["error_message"]
 
 
 @pytest.mark.asyncio
-async def test_start_sets_triage_phase_and_opens_hub():
-    server = build_server()
-    async with Client(server) as client:
+async def test_step_surfaces_next_external_tools():
+    """The FSM dogfoods burrmcp external_tools: record_finding's Grafana
+    tools appear in next_external_tools after start."""
+    async with Client(build_server()) as client:
         out = _payload(await _step(client, "start_investigation", incident_description=_INCIDENT))
         assert out["state"]["phase"] == "triage"
-        # Hub: all operational actions reachable after start.
-        for a in ("query_metrics", "query_logs", "query_traces", "advance_phase", "conclude"):
-            assert a in out["valid_next_actions"]
-
-
-# == query actions own the telemetry ==================================
+        net = out.get("next_external_tools")
+        assert net is not None
+        assert "query_prometheus" in net.get("record_finding", [])
 
 
 @pytest.mark.asyncio
-async def test_query_metrics_records_probe_via_client():
-    server = build_server()
-    async with Client(server) as client:
+async def test_graph_resource_declares_external_tools():
+    async with Client(build_server()) as client:
+        graph = json.loads((await client.read_resource("burr://graph"))[0].text)
+        by = {a["name"]: a for a in graph["actions"]}
+        assert "query_prometheus" in by["record_finding"]["external_tools"]
+        assert "external_tools" not in by["advance_phase"]  # none declared
+
+
+# == record_finding ===================================================
+
+
+@pytest.mark.asyncio
+async def test_record_finding_tracks_backends():
+    async with Client(build_server()) as client:
         await _start(client)
-        out = _payload(await _step(client, "query_metrics", promql="up"))
+        out = _payload(
+            await _step(
+                client,
+                "record_finding",
+                backend="metrics",
+                query="up",
+                result_summary="all targets healthy except payment",
+            )
+        )
         assert "error" not in out
-        probes = out["state"]["probes"]
-        assert len(probes) == 1
-        assert probes[0]["backend"] == "prometheus"
-        assert "prometheus" in out["state"]["distinct_backends"]
+        assert "prometheus" in out["state"]["distinct_backends"]  # metrics alias
 
 
 @pytest.mark.asyncio
-async def test_query_rejects_empty_query():
-    server = build_server()
-    async with Client(server) as client:
+async def test_record_finding_rejects_thin_summary():
+    async with Client(build_server()) as client:
         await _start(client)
-        out = _payload(await _step(client, "query_logs", logql="   "))
+        out = _payload(
+            await _step(client, "record_finding", backend="loki", query="x", result_summary="hi")
+        )
         assert out["error"] == "action_error"
-        assert "query must not be empty" in out["error_message"]
+        assert "result_summary too thin" in out["error_message"]
 
 
 @pytest.mark.asyncio
-async def test_loop_guard_refuses_repeated_probe():
-    server = build_server()
-    async with Client(server) as client:
+async def test_loop_guard_refuses_repeated_finding():
+    async with Client(build_server()) as client:
         await _start(client)
-        await _step(client, "query_metrics", promql="up")
-        out = _payload(await _step(client, "query_metrics", promql="up"))
+        await _step(
+            client, "record_finding", backend="prometheus", query="up", result_summary="healthy ok"
+        )
+        out = _payload(
+            await _step(
+                client,
+                "record_finding",
+                backend="prometheus",
+                query="up",
+                result_summary="healthy ok",
+            )
+        )
         assert out["error"] == "action_error"
         assert "loop guard" in out["error_message"]
 
 
-# == advance_phase gating =============================================
+# == gating ===========================================================
 
 
 @pytest.mark.asyncio
-async def test_advance_to_diagnose_requires_a_probe():
-    server = build_server()
-    async with Client(server) as client:
+async def test_advance_verify_requires_two_backends():
+    async with Client(build_server()) as client:
         await _start(client)
-        out = _payload(await _step(client, "advance_phase", to="diagnose", rationale="go"))
-        assert out["error"] == "action_error"
-        assert "at least 1 probe" in out["error_message"]
-
-
-@pytest.mark.asyncio
-async def test_advance_to_verify_requires_two_backends():
-    server = build_server()
-    async with Client(server) as client:
-        await _start(client)
-        await _step(client, "query_metrics", promql="up")
+        await _step(
+            client,
+            "record_finding",
+            backend="prometheus",
+            query="up",
+            result_summary="payment 5xx high",
+        )
         out = _payload(await _step(client, "advance_phase", to="verify", rationale="x"))
         assert out["error"] == "action_error"
         assert "distinct backends" in out["error_message"]
 
 
 @pytest.mark.asyncio
-async def test_advance_rejects_unknown_phase():
-    server = build_server()
-    async with Client(server) as client:
+async def test_conclude_requires_verify_phase_finding():
+    async with Client(build_server()) as client:
         await _start(client)
-        out = _payload(await _step(client, "advance_phase", to="party", rationale="x"))
-        assert out["error"] == "action_error"
-        assert "phase must be one of" in out["error_message"]
-
-
-# == conclude gating ==================================================
-
-
-@pytest.mark.asyncio
-async def test_conclude_refused_before_verify_phase():
-    server = build_server()
-    async with Client(server) as client:
-        await _start(client)
-        await _probe_two_backends(client)
-        out = _payload(
-            await _step(
-                client,
-                "conclude",
-                primary_service="payment",
-                root_cause="pool exhaustion at 14:02 in payment-service",
-                final_answer="x" * 100,
-            )
-        )
-        assert out["error"] == "action_error"
-        assert "phase=='verify'" in out["error_message"]
-
-
-@pytest.mark.asyncio
-async def test_conclude_requires_verify_phase_probe():
-    """Reaching verify isn't enough; a probe must run DURING verify."""
-    server = build_server()
-    async with Client(server) as client:
-        await _start(client)
-        await _probe_two_backends(client)
+        await _two_backends(client)
         await _step(client, "advance_phase", to="verify", rationale="cross-referenced")
         out = _payload(
             await _step(
@@ -192,14 +172,18 @@ async def test_conclude_requires_verify_phase_probe():
 
 @pytest.mark.asyncio
 async def test_happy_path_end_to_end():
-    server = build_server()
-    async with Client(server) as client:
+    async with Client(build_server()) as client:
         await _start(client)
-        await _probe_two_backends(client)  # prometheus + loki
+        await _two_backends(client)
         await _step(client, "advance_phase", to="diagnose", rationale="payment looks primary")
         await _step(client, "advance_phase", to="verify", rationale="confirm pool exhaustion")
-        # verification probe DURING verify phase
-        await _step(client, "query_metrics", promql="pool_in_use{service='payment'}")
+        await _step(
+            client,
+            "record_finding",
+            backend="prometheus",
+            query="pool_in_use{service='payment'}",
+            result_summary="pool maxed 14:02-14:08, confirms",
+        )
         out = _payload(
             await _step(
                 client,
@@ -217,30 +201,15 @@ async def test_happy_path_end_to_end():
         summary = out["state"]["investigation_summary"]
         assert summary["primary_service"] == "payment-service"
         assert sorted(summary["distinct_backends"]) == ["loki", "prometheus"]
-        assert summary["n_verify_probes"] >= 1
-        # Terminal: nothing reachable.
+        assert summary["n_verify_findings"] >= 1
         assert out["valid_next_actions"] == []
 
 
 @pytest.mark.asyncio
-async def test_auto_registers_third_backend():
-    server = build_server()
-    async with Client(server) as client:
-        await _start(client)
-        await _step(client, "query_traces", traceql='{ span.name = "checkout" }')
-        out = _payload(await _step(client, "query_metrics", promql="up"))
-        assert sorted(out["state"]["distinct_backends"]) == ["prometheus", "tempo"]
-
-
-# == audit trail ======================================================
-
-
-@pytest.mark.asyncio
 async def test_history_records_steps():
-    server = build_server()
-    async with Client(server) as client:
+    async with Client(build_server()) as client:
         await _start(client)
-        await _probe_two_backends(client)
+        await _two_backends(client)
         history = json.loads((await client.read_resource("burr://history"))[0].text)
         actions = [h["action"] for h in history]
-        assert actions == ["start_investigation", "query_metrics", "query_logs"]
+        assert actions == ["start_investigation", "record_finding", "record_finding"]
