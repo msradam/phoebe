@@ -89,24 +89,24 @@ class O11yFSMAgent(BaseAgent):
             source_path=SYSTEM_PROMPT, target_path="/app/system_prompt.txt"
         )
         await environment.upload_file(source_path=TASK_PROMPT, target_path="/app/task_prompt.txt")
-        # The o11y_fsm package source so the runner can `import o11y_fsm`.
-        for src in PACKAGE_ROOT.rglob("*.py"):
-            if "__pycache__" in src.parts:
-                continue
-            rel = src.relative_to(PACKAGE_ROOT)
-            await environment.upload_file(source_path=src, target_path=f"/app/o11y_fsm/{rel}")
-        # Vendor burrmcp's source too: it's not on PyPI, so the runner's
-        # `import burrmcp` (and o11y_fsm's) can't resolve it from a registry.
-        # Upload the installed package source under /app/burrmcp.
+        # Vendor both packages' source into the container. Neither o11y_fsm
+        # nor burrmcp is on PyPI, so the runner imports them from /app.
+        # Create every needed subdir first (rglob hits nested packages like
+        # burrmcp/_experimental), then upload.
         import burrmcp as _bm
 
-        burrmcp_root = Path(_bm.__file__).parent
-        await environment.exec(command="mkdir -p /app/burrmcp")
-        for src in burrmcp_root.rglob("*.py"):
-            if "__pycache__" in src.parts:
-                continue
-            rel = src.relative_to(burrmcp_root)
-            await environment.upload_file(source_path=src, target_path=f"/app/burrmcp/{rel}")
+        await self._upload_package(environment, PACKAGE_ROOT, "/app/o11y_fsm")
+        await self._upload_package(environment, Path(_bm.__file__).parent, "/app/burrmcp")
+
+    @staticmethod
+    async def _upload_package(environment: BaseEnvironment, root: Path, dest: str) -> None:
+        files = [s for s in root.rglob("*.py") if "__pycache__" not in s.parts]
+        dirs = sorted({str(Path(dest) / s.relative_to(root).parent) for s in files})
+        for d in dirs:
+            await environment.exec(command=f"mkdir -p {d}")
+        for src in files:
+            rel = src.relative_to(root)
+            await environment.upload_file(source_path=src, target_path=f"{dest}/{rel}")
 
     async def run(
         self,
