@@ -1,24 +1,20 @@
 # /// script
 # dependencies = [
 #   "apache-burr>=0.42,<0.43",
+#   "burrmcp>=0.1,<2.0",
 #   "pydantic>=2,<3",
 #   "litellm==1.83.10",
 #   "mcp>=1.9.0",
 # ]
 # ///
-"""o11y-fsm agent runner (v0.3, external_tools federation) — runs in the Harbor container.
+"""o11y-fsm agent runner (v0.5, single-surface via burrmcp upstream) — Harbor container.
 
-The agent sees BOTH surfaces:
-  - the o11y-fsm actions (start_investigation, record_finding,
-    advance_phase, conclude) — driven via in-process FSM steps;
-  - the Grafana MCP tools (query_prometheus, query_loki_logs, ...) —
-    passed through to the Grafana MCP session.
-
-The FSM does not proxy queries. It declares which Grafana tools are
-relevant per phase (mount(external_tools=...)); each FSM step response
-carries next_external_tools telling the agent which Grafana tools to
-call next. The agent calls them natively, then record_finding's the
-result. The Burr graph conducts; the Grafana server executes.
+The agent sees ONLY the o11y-fsm actions. The query actions drive Grafana
+THROUGH burrmcp's upstream mechanism: the runner binds an upstream manager
+that wraps its Grafana MCP session, so call_upstream("grafana", tool, args)
+inside an FSM action reaches Grafana. The Grafana tools are never exposed
+to the agent. Every query happens inside an action -> single surface,
+ledger-honest -> drives reliably even on a 70B model.
 """
 
 from __future__ import annotations
@@ -33,6 +29,8 @@ from pathlib import Path
 from typing import Any, cast
 
 sys.path.insert(0, "/app")
+
+from burrmcp.upstream import bind_upstream  # noqa: E402
 
 from o11y_fsm import build_application  # noqa: E402
 
@@ -60,31 +58,33 @@ def parse_tool_arguments(arguments: Any) -> dict[str, Any]:
     return {"_raw": str(arguments)}
 
 
-def relax_schema(schema: dict[str, Any]) -> dict[str, Any]:
-    """Collapse anyOf-of-string-or-null property types some MCP tools use,
-    which not every provider round-trips cleanly."""
-    import copy
-
-    out = copy.deepcopy(schema or {})
-
-    def _walk(node: Any) -> None:
-        if isinstance(node, dict):
-            if "anyOf" in node and "type" not in node:
-                non_null = [b for b in node["anyOf"] if b.get("type") != "null"]
-                if non_null:
-                    node.clear()
-                    node.update(non_null[0])
-            for v in node.values():
-                _walk(v)
-        elif isinstance(node, list):
-            for it in node:
-                _walk(it)
-
-    _walk(out)
-    return out
+def _extract(res: Any) -> Any:
+    if getattr(res, "structured_content", None) is not None:
+        return res.structured_content
+    if getattr(res, "content", None):
+        parts = [getattr(c, "text", "") for c in res.content if getattr(c, "text", "")]
+        if parts:
+            text = "\n".join(parts)
+            try:
+                return json.loads(text)
+            except (json.JSONDecodeError, TypeError):
+                return text
+    return None
 
 
-# == FSM actions as LLM tools ========================================
+class _SessionUpstream:
+    """Bind the runner's open Grafana MCP session as a burrmcp upstream, so
+    the FSM's call_upstream('grafana', tool, args) routes to it."""
+
+    def __init__(self, session: Any):
+        self._session = session
+
+    async def call(self, server: str, tool: str, args: dict[str, Any]) -> Any:
+        res = await self._session.call_tool(tool, args or {})
+        return _extract(res)
+
+
+# == FSM actions as the ONLY LLM tools (single surface) ==============
 
 FSM_TOOLS: list[dict[str, Any]] = [
     {
@@ -105,21 +105,45 @@ FSM_TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "record_finding",
-            "description": (
-                "Record a finding from a Grafana query you ALREADY ran. Call a "
-                "Grafana tool first (see next_external_tools), then record what "
-                "it showed here. The FSM gates progression on the evidence."
-            ),
+            "name": "query_metrics",
+            "description": "Run a PromQL query against Grafana and record it. The server handles the datasource + time window.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "backend": {"type": "string", "description": "prometheus | loki | tempo"},
-                    "query": {"type": "string"},
-                    "result_summary": {"type": "string"},
+                    "promql": {"type": "string"},
                     "hypothesis": {"type": "string"},
                 },
-                "required": ["backend", "query", "result_summary"],
+                "required": ["promql"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_logs",
+            "description": "Run a LogQL query against Grafana and record it.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "logql": {"type": "string"},
+                    "hypothesis": {"type": "string"},
+                },
+                "required": ["logql"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_traces",
+            "description": "Run a TraceQL search against Grafana and record it.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "traceql": {"type": "string"},
+                    "hypothesis": {"type": "string"},
+                },
+                "required": ["traceql"],
             },
         },
     },
@@ -127,10 +151,7 @@ FSM_TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "advance_phase",
-            "description": (
-                "Advance triage -> diagnose -> verify. to='diagnose' needs >=1 "
-                "finding; to='verify' needs findings from >=2 distinct backends."
-            ),
+            "description": "triage -> diagnose -> verify. diagnose needs >=1 finding; verify needs >=2 distinct backends.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -145,10 +166,7 @@ FSM_TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "conclude",
-            "description": (
-                "Finish with the conclusion + final answer. Requires phase=='verify', "
-                "findings from >=2 backends, and a finding recorded during verify."
-            ),
+            "description": "Finish. Requires phase=='verify', >=2 backends, and a verify-phase finding.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -184,16 +202,6 @@ def _valid_next_actions(app: Any) -> list[str]:
     return valid
 
 
-# external_tools map, mirrored from o11y_fsm.app so the runner can surface
-# next_external_tools in the FSM step observation (the in-process FSM
-# doesn't go through burrmcp.mount, so we attach it here).
-from o11y_fsm.app import EXTERNAL_TOOLS  # noqa: E402
-
-
-def _next_external_tools(valid: list[str]) -> dict[str, list[str]]:
-    return {a: EXTERNAL_TOOLS[a] for a in valid if EXTERNAL_TOOLS.get(a)}
-
-
 async def step_fsm(app: Any, action: str, inputs: dict[str, Any]) -> dict[str, Any]:
     legal = _valid_next_actions(app)
     if action not in legal:
@@ -201,7 +209,6 @@ async def step_fsm(app: Any, action: str, inputs: dict[str, Any]) -> dict[str, A
             "error": "invalid_transition",
             "requested": action,
             "valid_next_actions": legal,
-            "next_external_tools": _next_external_tools(legal),
             "message": f"action {action!r} not reachable now. Reachable: {legal}.",
         }
     target = app.graph.get_action(action)
@@ -216,12 +223,10 @@ async def step_fsm(app: Any, action: str, inputs: dict[str, Any]) -> dict[str, A
     finally:
         app.get_next_action = original  # type: ignore[method-assign]
     sv = {k: v for k, v in new_state.get_all().items() if not k.startswith("__")}
-    valid = _valid_next_actions(app)
     return {
         "ok": True,
         "action_executed": action,
-        "valid_next_actions": valid,
-        "next_external_tools": _next_external_tools(valid),
+        "valid_next_actions": _valid_next_actions(app),
         "state": {
             "phase": sv.get("phase"),
             "distinct_backends": sv.get("distinct_backends"),
@@ -237,16 +242,6 @@ def fsm_terminated(app: Any) -> bool:
         return app.state.get("final_answer") not in (None, "")
     except Exception:
         return False
-
-
-def _extract_text(res: Any) -> str:
-    if getattr(res, "structured_content", None) is not None:
-        return json.dumps(res.structured_content, default=str)
-    if getattr(res, "content", None):
-        parts = [getattr(c, "text", "") for c in res.content if getattr(c, "text", "")]
-        if parts:
-            return "\n".join(parts)
-    return ""
 
 
 SYSTEM_PROMPT = Path("/app/system_prompt.txt").read_text(encoding="utf-8")
@@ -270,47 +265,33 @@ async def run_agent() -> None:
 
     agent_dir = Path("/logs/agent")
     agent_dir.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("O11Y_SCENARIO_TIME_ISO", scenario_clock_iso())
     fsm_app = build_application(tracking=False)
     stats = {"input": 0, "output": 0, "cost": 0.0}
     steps_log: list[dict[str, Any]] = []
     total_tool_calls = 0
     start = time.time()
 
-    print(f"Connecting to Grafana MCP at {mcp_url}...")
+    print(
+        f"Connecting to Grafana MCP at {mcp_url} (bound as upstream; not exposed to the agent)..."
+    )
     async with streamable_http_client(mcp_url) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
-            listed = await session.list_tools()
-            grafana_tools = [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        "description": (t.description or "").strip()[:1024],
-                        "parameters": relax_schema(t.inputSchema or {}),
-                    },
-                }
-                for t in listed.tools
-            ]
-            grafana_names = {t["function"]["name"] for t in grafana_tools}
-            print(
-                f"Discovered {len(grafana_tools)} Grafana tools; exposing them "
-                f"alongside {len(FSM_TOOLS)} FSM tools (federation)."
-            )
-
-            tools_for_llm = FSM_TOOLS + grafana_tools
+            # Bind Grafana as the FSM's upstream. The agent never sees these tools.
+            bind_upstream(_SessionUpstream(session))
+            print("Grafana bound as upstream. Agent surface = FSM actions only (single surface).")
 
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": task_prompt},
             ]
-
             step = 0
             while step < MAX_STEPS:
                 step += 1
                 print(f"[{step}]", end=" ", flush=True)
                 resp = await litellm.acompletion(
-                    model=model, messages=messages, tools=tools_for_llm, tool_choice="auto"
+                    model=model, messages=messages, tools=FSM_TOOLS, tool_choice="auto"
                 )
                 msg = cast(Any, resp).choices[0].message
                 tool_calls = msg.tool_calls or []
@@ -322,14 +303,12 @@ async def run_agent() -> None:
                     stats["cost"] += litellm.completion_cost(completion_response=resp) or 0.0
                 except Exception:
                     pass
-
                 if not tool_calls:
                     steps_log.append(
                         {"step": step, "type": "assistant", "content": msg.content or ""}
                     )
                     print("done (no tool calls)")
                     break
-
                 messages.append(msg.model_dump())
                 total_tool_calls += len(tool_calls)
                 for tc in tool_calls:
@@ -338,15 +317,6 @@ async def run_agent() -> None:
                     if fn in _FSM_ACTION_NAMES:
                         obs = await step_fsm(fsm_app, fn, args)
                         tag = obs.get("error", "ok")
-                    elif fn in grafana_names:
-                        try:
-                            res = await session.call_tool(fn, args)
-                            text = _extract_text(res)
-                            obs = {"ok": True, "tool": fn, "result": text[:5000]}
-                            tag = "grafana"
-                        except Exception as e:  # noqa: BLE001
-                            obs = {"error": "grafana_tool_error", "tool": fn, "message": str(e)}
-                            tag = "grafana_err"
                     else:
                         obs = {"error": "unknown_tool", "tool": fn}
                         tag = "unknown"
@@ -379,7 +349,7 @@ async def run_agent() -> None:
     traj = {
         "schema_version": "ATIF-v1.7",
         "session_id": str(uuid.uuid4()),
-        "agent": {"name": "o11y-fsm", "version": "0.3.0", "model_name": model},
+        "agent": {"name": "o11y-fsm", "version": "0.5.0", "model_name": model},
         "steps": steps_log,
         "final_metrics": {
             "total_prompt_tokens": stats["input"],
