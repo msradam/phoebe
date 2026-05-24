@@ -1,0 +1,65 @@
+[project]
+name = "o11y-fsm"
+version = "0.1.0"
+description = "An observability/SRE finite-state machine for LLM-driven incident investigation. Mounts via BurrMCP. Reference application + Harbor agent for o11y-bench."
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = "Apache-2.0"
+authors = [
+    { name = "Adam Munawar Rahman", email = "msrahmanadam@gmail.com" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Monitoring",
+]
+dependencies = [
+    "apache-burr[tracking]>=0.42,<0.43",
+    "burrmcp>=0.1,<2.0",
+    "fastmcp>=3.3,<3.4",
+    "pydantic>=2,<3",
+]
+
+[project.optional-dependencies]
+# Harbor agent extras: needed when running as the o11y-bench agent.
+# Not required just to import the FSM as a Burr Application.
+harbor = [
+    "harbor==0.6.5",
+    "litellm>=1.50",
+    "mcp>=1.0",
+]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.7",
+]
+
+[project.urls]
+Homepage = "https://github.com/msradam/o11y-fsm"
+Repository = "https://github.com/msradam/o11y-fsm"
+Issues = "https://github.com/msradam/o11y-fsm/issues"
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/o11y_fsm"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

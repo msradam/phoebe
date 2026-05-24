@@ -1,0 +1,4 @@
+Scenario clock: {current_time}
+
+Task:
+{statement}
