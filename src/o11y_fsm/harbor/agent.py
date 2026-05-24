@@ -54,7 +54,7 @@ def _build_runner_command() -> str:
     return f"bash -lc {shlex.quote(cmd)}"
 
 
-class O11yFsmAgent(BaseAgent):
+class O11yFSMAgent(BaseAgent):
     """Harbor agent that walks the o11y-fsm Burr application inside the
     bench container, exposing both Grafana MCP tools and an in-process
     ``advance_workflow`` tool to the caller LLM.

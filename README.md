@@ -49,7 +49,7 @@ burrmcp serve o11y_fsm.app:build_application --name o11y-fsm
 
 ## Use on o11y-bench
 
-`o11y_fsm.harbor:O11yFsmAgent` is a [Harbor `BaseAgent`](https://www.harborframework.com/docs/agents) that wraps the FSM. It:
+`o11y_fsm.harbor:O11yFSMAgent` is a [Harbor `BaseAgent`](https://www.harborframework.com/docs/agents) that wraps the FSM. It:
 
 1. Walks the FSM via MCP
 2. Routes the caller LLM's tool calls to Grafana's MCP server (`mcp-grafana`, exposed in Harbor's o11y-stack sidecar)
@@ -59,7 +59,7 @@ To use it in an o11y-bench job:
 
 ```bash
 mise run bench:job -- \
-  --agent-import-path o11y_fsm.harbor:O11yFsmAgent \
+  --agent-import-path o11y_fsm.harbor:O11yFSMAgent \
   --model openai/meta-llama/Llama-3.3-70B-Instruct-Turbo \
   --task-name incident-triage \
   --n-attempts 3
