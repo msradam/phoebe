@@ -22,7 +22,6 @@ from typing import Any
 
 from burr.core import ApplicationBuilder, Condition, State, action
 from burr.tracking.client import LocalTrackingClient
-from burrmcp import ServingMode, mount
 
 from o11y_fsm.prompts import (
     PROMPT_CORRELATE,
@@ -449,7 +448,15 @@ def build_application():
 
 
 def build_server():
-    """Mount the o11y-fsm application as an MCP server."""
+    """Mount the o11y-fsm application as an MCP server.
+
+    Imports burrmcp lazily so that ``build_application`` (pure Burr) can be
+    used in environments where burrmcp isn't installed (e.g. the Harbor
+    agent runner drives the Application directly via ``astep`` and never
+    needs the MCP layer).
+    """
+    from burrmcp import ServingMode, mount
+
     return mount(
         build_application,
         mode=ServingMode.STEP,

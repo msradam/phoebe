@@ -1,8 +1,6 @@
 # /// script
 # dependencies = [
 #   "apache-burr[tracking]>=0.42,<0.43",
-#   "burrmcp>=0.1,<2.0",
-#   "fastmcp>=3.3,<3.4",
 #   "pydantic>=2,<3",
 #   "litellm==1.83.10",
 #   "mcp>=1.9.0",

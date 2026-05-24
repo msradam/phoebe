@@ -3,7 +3,7 @@ name = "o11y-fsm"
 version = "0.1.0"
 description = "An observability/SRE finite-state machine for LLM-driven incident investigation. Mounts via BurrMCP. Reference application + Harbor agent for o11y-bench."
 readme = "README.md"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.11,<3.15"
 license = "Apache-2.0"
 authors = [
     { name = "Adam Munawar Rahman", email = "msrahmanadam@gmail.com" },
