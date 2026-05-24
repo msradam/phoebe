@@ -95,6 +95,18 @@ class O11yFSMAgent(BaseAgent):
                 continue
             rel = src.relative_to(PACKAGE_ROOT)
             await environment.upload_file(source_path=src, target_path=f"/app/o11y_fsm/{rel}")
+        # Vendor burrmcp's source too: it's not on PyPI, so the runner's
+        # `import burrmcp` (and o11y_fsm's) can't resolve it from a registry.
+        # Upload the installed package source under /app/burrmcp.
+        import burrmcp as _bm
+
+        burrmcp_root = Path(_bm.__file__).parent
+        await environment.exec(command="mkdir -p /app/burrmcp")
+        for src in burrmcp_root.rglob("*.py"):
+            if "__pycache__" in src.parts:
+                continue
+            rel = src.relative_to(burrmcp_root)
+            await environment.upload_file(source_path=src, target_path=f"/app/burrmcp/{rel}")
 
     async def run(
         self,

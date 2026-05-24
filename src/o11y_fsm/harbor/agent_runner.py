@@ -1,12 +1,15 @@
 # /// script
 # dependencies = [
 #   "apache-burr>=0.42,<0.43",
-#   "burrmcp>=0.1,<2.0",
+#   "fastmcp>=3.3,<3.4",
 #   "pydantic>=2,<3",
 #   "litellm==1.83.10",
 #   "mcp>=1.9.0",
 # ]
 # ///
+# Note: burrmcp is not on PyPI; its source is vendored into /app/burrmcp
+# by the Harbor agent's setup(). /app is on sys.path, so `import burrmcp`
+# resolves to the vendored copy.
 """o11y-fsm agent runner (v0.5, single-surface via burrmcp upstream) — Harbor container.
 
 The agent sees ONLY the o11y-fsm actions. The query actions drive Grafana
