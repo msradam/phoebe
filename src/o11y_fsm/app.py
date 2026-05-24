@@ -21,7 +21,6 @@ from __future__ import annotations
 from typing import Any
 
 from burr.core import ApplicationBuilder, Condition, State, action
-from burr.tracking.client import LocalTrackingClient
 
 from o11y_fsm.prompts import (
     PROMPT_CORRELATE,
@@ -394,14 +393,22 @@ _HYPOTHESIS_DISCONFIRMED = Condition.expr(
 )
 
 
-def build_application():
+def build_application(tracking: bool = True):
     """Build the o11y-fsm Burr Application.
 
     Returns a fresh ``burr.core.Application`` per call; pass this function
     (not its result) as the factory to ``mount(...)`` for per-session
     state isolation.
+
+    Args:
+        tracking: wire a ``LocalTrackingClient`` so the session shows up in
+            the Burr UI and ``burrmcp sessions`` commands. Default True.
+            Set False in minimal environments (e.g. the Harbor agent runner
+            inside a container) where the tracking extra's transitive
+            ``psutil`` build dependency isn't available; the FSM logic is
+            identical, only the on-disk audit trail is skipped.
     """
-    return (
+    builder = (
         ApplicationBuilder()
         .with_actions(
             start_investigation=start_investigation,
@@ -424,8 +431,13 @@ def build_application():
             ("verify_or_revise", "recommend_next_steps", _HYPOTHESIS_CONFIRMED),
             ("verify_or_revise", "form_hypothesis", _HYPOTHESIS_DISCONFIRMED),
         )
-        .with_tracker(LocalTrackingClient(project=_TRACKER_PROJECT))
-        .with_state(
+    )
+    if tracking:
+        from burr.tracking.client import LocalTrackingClient
+
+        builder = builder.with_tracker(LocalTrackingClient(project=_TRACKER_PROJECT))
+    return (
+        builder.with_state(
             incident_description="",
             scenario_time="",
             available_backends=[],

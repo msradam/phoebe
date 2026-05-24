@@ -1,6 +1,6 @@
 # /// script
 # dependencies = [
-#   "apache-burr[tracking]>=0.42,<0.43",
+#   "apache-burr>=0.42,<0.43",
 #   "pydantic>=2,<3",
 #   "litellm==1.83.10",
 #   "mcp>=1.9.0",
@@ -315,7 +315,7 @@ async def run_agent() -> None:
     stats = {"input": 0, "output": 0, "cost": 0.0}
     step_id = 0
     total_tool_calls = 0
-    fsm_app = build_application()
+    fsm_app = build_application(tracking=False)
     start = time.time()
 
     def flush() -> None:
