@@ -65,4 +65,5 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
     "file_name: load data-driven cases from a JSON file (burr.testing).",
+    "live: hits a real model provider; opt-in via RUN_LIVE=1.",
 ]

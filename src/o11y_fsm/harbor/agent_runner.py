@@ -30,9 +30,12 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import sys
 import time
 import uuid
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -90,6 +93,75 @@ class _SessionUpstream:
     async def call(self, server: str, tool: str, args: dict[str, Any]) -> Any:
         res = await self._session.call_tool(tool, args or {})
         return _extract(res)
+
+
+@dataclass
+class ToolCall:
+    id: str
+    name: str
+    arguments: dict[str, Any]
+
+
+# Some models (Kimi K2.x) emit tool calls in their native token format inside
+# the message *content* instead of the structured tool_calls field when routed
+# through an OpenAI-compatible endpoint. Recover those so a parse miss does not
+# silently end the run. Format:
+#   <|tool_call_begin|>functions.NAME:IDX<|tool_call_argument_begin|>{json}<|tool_call_end|>
+_LEAKED_CALL_RE = re.compile(
+    r"<\|tool_call_begin\|>\s*(?:functions\.)?([A-Za-z0-9_]+)\s*:?\s*\d*\s*"
+    r"<\|tool_call_argument_begin\|>(.*?)<\|tool_call_end\|>",
+    re.DOTALL,
+)
+
+
+def extract_tool_calls(msg: Any) -> list[ToolCall]:
+    """Normalize a model message into tool calls, from the structured
+    tool_calls field when present, else by parsing leaked native-format
+    tool-call tokens out of the content."""
+    structured = getattr(msg, "tool_calls", None) or []
+    calls: list[ToolCall] = []
+    for i, tc in enumerate(structured):
+        fn = tc.function
+        calls.append(
+            ToolCall(
+                id=getattr(tc, "id", None) or f"call_{i}",
+                name=fn.name or "",
+                arguments=parse_tool_arguments(fn.arguments),
+            )
+        )
+    if calls:
+        return calls
+    content = getattr(msg, "content", None) or ""
+    for i, m in enumerate(_LEAKED_CALL_RE.finditer(content)):
+        calls.append(
+            ToolCall(
+                id=f"leaked_{i}",
+                name=m.group(1),
+                arguments=parse_tool_arguments(m.group(2).strip()),
+            )
+        )
+    return calls
+
+
+def assistant_message(content: str | None, calls: list[ToolCall]) -> dict[str, Any]:
+    """Rebuild a well-formed assistant message from normalized calls, so the
+    transcript stays valid whether the calls were structured or leaked."""
+    text = content or ""
+    if "<|tool_call" in text:
+        text = _LEAKED_CALL_RE.sub("", text)
+        text = re.sub(r"<\|tool_calls?_section_(?:begin|end)\|>", "", text).strip()
+    return {
+        "role": "assistant",
+        "content": text,
+        "tool_calls": [
+            {
+                "id": c.id,
+                "type": "function",
+                "function": {"name": c.name, "arguments": json.dumps(c.arguments)},
+            }
+            for c in calls
+        ],
+    }
 
 
 # == FSM actions as the ONLY LLM tools (single surface) ==============
@@ -255,6 +327,53 @@ def fsm_terminated(app: Any) -> bool:
 MAX_STEPS = 50
 
 
+async def drive_investigation(
+    complete: Callable[[list[dict[str, Any]]], Awaitable[Any]],
+    fsm_app: Any,
+    messages: list[dict[str, Any]],
+    *,
+    max_steps: int = MAX_STEPS,
+    log: Callable[[str], None] = lambda _s: None,
+) -> dict[str, Any]:
+    """Drive the FSM by calling ``complete(messages)`` for each turn until the
+    FSM terminates or max_steps. ``complete`` returns a model message (with
+    ``.content`` and optionally ``.tool_calls``). Pure of any LLM/transport
+    dependency so it is testable with a scripted ``complete`` and a mock
+    upstream bound on the ContextVar.
+    """
+    steps_log: list[dict[str, Any]] = []
+    total_tool_calls = 0
+    step = 0
+    while step < max_steps:
+        step += 1
+        msg = await complete(messages)
+        calls = extract_tool_calls(msg)
+        if not calls:
+            steps_log.append(
+                {"step": step, "type": "assistant", "content": getattr(msg, "content", "") or ""}
+            )
+            log(f"[{step}] done (no tool calls)")
+            break
+        messages.append(assistant_message(getattr(msg, "content", ""), calls))
+        total_tool_calls += len(calls)
+        for c in calls:
+            if c.name in _FSM_ACTION_NAMES:
+                obs = await step_fsm(fsm_app, c.name, c.arguments)
+                tag = obs.get("error", "ok")
+            else:
+                obs = {"error": "unknown_tool", "tool": c.name}
+                tag = "unknown"
+            log(f"[{step}] {c.name}({tag})")
+            messages.append(
+                {"role": "tool", "tool_call_id": c.id, "content": json.dumps(obs, default=str)}
+            )
+        steps_log.append({"step": step, "calls": [c.name for c in calls]})
+        if fsm_terminated(fsm_app):
+            log(f"[{step}] FSM terminated")
+            break
+    return {"steps": steps_log, "total_tool_calls": total_tool_calls}
+
+
 async def run_agent() -> None:
     import litellm
     from mcp.client.session import ClientSession
@@ -294,50 +413,28 @@ async def run_agent() -> None:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": task_prompt},
             ]
-            step = 0
-            while step < MAX_STEPS:
-                step += 1
-                print(f"[{step}]", end=" ", flush=True)
+
+            async def complete(msgs: list[dict[str, Any]]) -> Any:
                 resp = await litellm.acompletion(
-                    model=model, messages=messages, tools=FSM_TOOLS, tool_choice="auto"
+                    model=model, messages=msgs, tools=FSM_TOOLS, tool_choice="auto"
                 )
-                msg = cast(Any, resp).choices[0].message
-                tool_calls = msg.tool_calls or []
                 u = cast(Any, resp).usage
                 if u:
                     stats["input"] += getattr(u, "prompt_tokens", 0) or 0
                     stats["output"] += getattr(u, "completion_tokens", 0) or 0
                 with contextlib.suppress(Exception):
                     stats["cost"] += litellm.completion_cost(completion_response=resp) or 0.0
-                if not tool_calls:
-                    steps_log.append(
-                        {"step": step, "type": "assistant", "content": msg.content or ""}
-                    )
-                    print("done (no tool calls)")
-                    break
-                messages.append(msg.model_dump())
-                total_tool_calls += len(tool_calls)
-                for tc in tool_calls:
-                    fn = tc.function.name or ""
-                    args = parse_tool_arguments(tc.function.arguments)
-                    if fn in _FSM_ACTION_NAMES:
-                        obs = await step_fsm(fsm_app, fn, args)
-                        tag = obs.get("error", "ok")
-                    else:
-                        obs = {"error": "unknown_tool", "tool": fn}
-                        tag = "unknown"
-                    print(f"{fn}({tag})", end=" ", flush=True)
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": json.dumps(obs, default=str),
-                        }
-                    )
-                steps_log.append({"step": step, "calls": [tc.function.name for tc in tool_calls]})
-                if fsm_terminated(fsm_app):
-                    print("FSM terminated")
-                    break
+                return cast(Any, resp).choices[0].message
+
+            result = await drive_investigation(
+                complete,
+                fsm_app,
+                messages,
+                max_steps=MAX_STEPS,
+                log=lambda s: print(s, flush=True),
+            )
+            steps_log = result["steps"]
+            total_tool_calls = result["total_tool_calls"]
             print("done")
 
             final_answer = ""
