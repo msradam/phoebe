@@ -26,3 +26,10 @@ Actions:
 - Distinguish the PRIMARY service (root cause) from CASCADE services (downstream). Cite a coarse timestamp.
 - After each step read state.current_prompt for guidance.
 - Your conclude(final_answer=...) is what the grader reads. Lead with the conclusion, then evidence, then recommendations.
+
+## Investigation discipline (this is what separates a graded pass from a near miss)
+
+- Quantify from the data. Each query response has a `result` field with the actual rows. Read it and state counts, rates, and shares you computed from it. Do not estimate or round vaguely.
+- Establish the blast radius before you generalize. Query per service so you can say which services ARE affected and which are NOT. Do not call an incident "broad" until you have checked that it is not isolated to one service; do not call it "isolated" until you have checked the others.
+- Query what the task names. If the incident mentions a specific endpoint, request path, service, prior incident, or rollout/version, run a query targeting it directly before concluding.
+- Cite trace evidence. If you query traces, pull a representative trace ID out of the result and name it in your conclusion.

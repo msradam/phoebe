@@ -250,10 +250,23 @@ FSM_TOOLS: list[dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "primary_service": {"type": "string"},
+                    "primary_service": {"type": "string", "description": "The root-cause service."},
                     "root_cause": {"type": "string"},
-                    "final_answer": {"type": "string"},
-                    "cascade_services": {"type": "array", "items": {"type": "string"}},
+                    "final_answer": {
+                        "type": "string",
+                        "description": (
+                            "Markdown response the grader reads. Lead with the conclusion, then "
+                            "evidence. Include: a number quantified from a query (count/rate/share, "
+                            "not estimated); the blast radius (which services are affected and which "
+                            "are not; isolated vs broad); the primary service vs downstream cascade; "
+                            "a coarse timestamp; and a representative trace ID if traces were queried."
+                        ),
+                    },
+                    "cascade_services": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Downstream services affected as a knock-on, not the root cause.",
+                    },
                 },
                 "required": ["primary_service", "root_cause", "final_answer"],
             },
@@ -303,6 +316,8 @@ async def step_fsm(app: Any, action: str, inputs: dict[str, Any]) -> dict[str, A
     finally:
         app.get_next_action = original  # type: ignore[method-assign]
     sv = {k: v for k, v in new_state.get_all().items() if not k.startswith("__")}
+    findings = sv.get("findings") or []
+    last = findings[-1] if findings else None
     return {
         "ok": True,
         "action_executed": action,
@@ -310,10 +325,13 @@ async def step_fsm(app: Any, action: str, inputs: dict[str, Any]) -> dict[str, A
         "state": {
             "phase": sv.get("phase"),
             "distinct_backends": sv.get("distinct_backends"),
-            "n_findings": len(sv.get("findings") or []),
+            "n_findings": len(findings),
             "current_prompt": sv.get("current_prompt"),
             "final_answer_set": sv.get("final_answer") is not None,
         },
+        # Surface the actual query result so the agent can quantify and cite it,
+        # rather than reasoning from the short prompt summary alone.
+        "result": (last or {}).get("result_summary") if action.startswith("query_") else None,
     }
 
 

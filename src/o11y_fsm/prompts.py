@@ -49,7 +49,16 @@ def after_start(
         "Cross-reference at least two backends. When you have a leading "
         "hypothesis, advance_phase(to='diagnose', rationale=...), then "
         "(after >=2 backends) advance_phase(to='verify', ...) and run a "
-        "confirming probe before conclude(...)."
+        "confirming probe before conclude(...).\n\n"
+        "Investigation discipline:\n"
+        "- Quantify from the query results you get back (counts, rates, shares). "
+        "Read the 'result' field on each tool response; do not estimate numbers.\n"
+        "- Establish the blast radius: query per service so you can say which "
+        "services ARE and are NOT affected, not just the loudest one.\n"
+        "- If the incident names a specific endpoint, path, service, prior "
+        "incident, or rollout, query that directly before concluding.\n"
+        "- If you query traces, note a representative trace ID from the result so "
+        "you can cite it."
     )
 
 
@@ -64,7 +73,7 @@ def after_probe(
     lines = [
         f"Recorded {backend} probe ({n_probes} total). Phase: {phase.upper()}.",
         f"Backends covered so far: {distinct_backends}.",
-        f"Last result: {summary[:160]}",
+        f"Last result (read it; quantify from it, do not estimate): {summary[:600]}",
     ]
     if len(distinct_backends) < 2:
         lines.append(
@@ -86,7 +95,16 @@ def after_advance(to: str, distinct_backends: list[str], n_probes: int) -> str:
             "Run ONE focused probe that confirms (or refutes) your leading "
             "hypothesis, then call conclude(primary_service, root_cause, "
             "final_answer, cascade_services=[]). conclude is blocked until a "
-            "probe runs during this verify phase."
+            "probe runs during this verify phase.\n\n"
+            "Before you conclude, make sure your final_answer:\n"
+            "- quantifies the impact with a number from a query (a count, rate, or "
+            "share you actually computed), not an estimate;\n"
+            "- states the blast radius: which services are affected and which are "
+            "not, and whether the incident is isolated or broad;\n"
+            "- separates the primary/root-cause service from downstream cascade;\n"
+            "- cites a representative trace ID if you queried traces;\n"
+            "- addresses any specific endpoint, prior incident, or rollout the task "
+            "named. If you have not queried it yet, do that now."
         )
     return (
         f"Phase: {to.upper()}. Keep gathering / cross-referencing evidence. "

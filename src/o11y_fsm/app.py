@@ -113,7 +113,7 @@ def _distinct_backends(findings: list[dict[str, Any]]) -> set[str]:
     return {f["backend"] for f in findings if f.get("backend")}
 
 
-def _summarize(result: Any, limit: int = 300) -> str:
+def _summarize(result: Any, limit: int = 1200) -> str:
     s = result if isinstance(result, str) else __import__("json").dumps(result, default=str)
     return s[:limit]
 
