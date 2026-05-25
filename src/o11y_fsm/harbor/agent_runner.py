@@ -325,6 +325,13 @@ def fsm_terminated(app: Any) -> bool:
 
 
 MAX_STEPS = 50
+MAX_NO_CALL_TURNS = 3
+_NUDGE = (
+    "You did not call a tool. Do not answer in prose. Advance the investigation by "
+    "calling one FSM tool (query_metrics / query_logs / query_traces / advance_phase), "
+    "and once phase=='verify' with findings from >=2 backends, call conclude(...). "
+    "Read state.current_prompt for the valid next actions and the discovered schema."
+)
 
 
 async def drive_investigation(
@@ -344,16 +351,27 @@ async def drive_investigation(
     steps_log: list[dict[str, Any]] = []
     total_tool_calls = 0
     step = 0
+    consecutive_no_calls = 0
     while step < max_steps:
         step += 1
         msg = await complete(messages)
         calls = extract_tool_calls(msg)
         if not calls:
-            steps_log.append(
-                {"step": step, "type": "assistant", "content": getattr(msg, "content", "") or ""}
-            )
-            log(f"[{step}] done (no tool calls)")
-            break
+            content = getattr(msg, "content", "") or ""
+            steps_log.append({"step": step, "type": "assistant", "content": content})
+            consecutive_no_calls += 1
+            # A reasoning model intermittently returns an empty or prose-only turn.
+            # Do not treat that as completion: keep any content, nudge it to act,
+            # and only give up after several consecutive no-call turns.
+            if consecutive_no_calls >= MAX_NO_CALL_TURNS:
+                log(f"[{step}] no tool calls {consecutive_no_calls}x; stopping")
+                break
+            if content:
+                messages.append({"role": "assistant", "content": content})
+            messages.append({"role": "user", "content": _NUDGE})
+            log(f"[{step}] no tool calls; nudging ({consecutive_no_calls}/{MAX_NO_CALL_TURNS})")
+            continue
+        consecutive_no_calls = 0
         messages.append(assistant_message(getattr(msg, "content", ""), calls))
         total_tool_calls += len(calls)
         for c in calls:

@@ -114,10 +114,46 @@ async def test_loop_reaches_conclusion_even_with_leaked_calls():
 
 
 @pytest.mark.asyncio
-async def test_loop_stops_when_model_emits_no_calls():
-    script = _ScriptedLLM([SimpleNamespace(content="I am done thinking.", tool_calls=None)])
+async def test_loop_nudges_past_an_empty_turn():
+    final = (
+        "Primary payment-service exhausted its connection pool; order-service cascaded. "
+        "Metrics and logs agree on the timing."
+    )
+    script = _ScriptedLLM(
+        [
+            _structured(
+                "start_investigation",
+                {"incident_description": "5xx spike", "scenario_time": "2026-05-24T14:00:00Z"},
+            ),
+            SimpleNamespace(content="", tool_calls=None),  # intermittent empty turn
+            _structured("query_metrics", {"promql": "sum(rate(http_requests_total[5m]))"}),
+            _structured("query_logs", {"logql": '{service_name="payment-service"} |= "error"'}),
+            _structured("advance_phase", {"to": "diagnose", "rationale": "payment leads"}),
+            _structured("advance_phase", {"to": "verify", "rationale": "metrics and logs agree"}),
+            _structured("query_metrics", {"promql": "pool_in_use{service='payment'}"}),
+            _structured(
+                "conclude",
+                {
+                    "primary_service": "payment-service",
+                    "cascade_services": ["order-service"],
+                    "root_cause": "connection pool exhaustion",
+                    "final_answer": final,
+                },
+            ),
+        ]
+    )
     app = build_application(tracking=False)
     messages: list[dict[str, Any]] = [{"role": "user", "content": "y"}]
-    result = await runner.drive_investigation(script, app, messages, max_steps=5)
+    result = await runner.drive_investigation(script, app, messages, max_steps=20)
+    assert runner.fsm_terminated(app), result
+    assert app.state["final_answer"] == final
+
+
+@pytest.mark.asyncio
+async def test_loop_stops_after_repeated_no_calls():
+    script = _ScriptedLLM([SimpleNamespace(content="", tool_calls=None) for _ in range(5)])
+    app = build_application(tracking=False)
+    messages: list[dict[str, Any]] = [{"role": "user", "content": "y"}]
+    result = await runner.drive_investigation(script, app, messages, max_steps=10)
     assert not runner.fsm_terminated(app)
-    assert result["steps"][-1]["type"] == "assistant"
+    assert len(result["steps"]) == runner.MAX_NO_CALL_TURNS
