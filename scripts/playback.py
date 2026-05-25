@@ -44,18 +44,55 @@ class _Mock:
         return {"ok": True, "tool": tool}
 
 
+# The agent has the full Grafana toolset; record_probe logs each real tool call
+# as evidence. A repeated call triggers the loop guard, to show a refusal.
 _WALK: list[tuple[str, dict[str, Any]]] = [
     (
         "start_investigation",
         {"incident_description": "5xx spike across services", "scenario_time": "2026-05-25T06:50:00Z"},
     ),
-    ("query_metrics", {"promql": 'sum by (job) (rate(http_requests_total{status=~"5.."}[5m]))'}),
-    ("query_logs", {"logql": '{service="payment-service"} |= "error"'}),
-    # a deliberately repeated probe, refused by the loop guard, to show a refusal:
-    ("query_logs", {"logql": '{service="payment-service"} |= "error"'}),
+    (
+        "record_probe",
+        {
+            "tool": "query_prometheus",
+            "backend": "prometheus",
+            "query": 'sum by (job) (rate(http_requests_total{status=~"5.."}[5m]))',
+            "result_summary": "payment-service 5xx rising from 06:48; others flat",
+            "hypothesis": "which service leads the error rate",
+        },
+    ),
+    (
+        "record_probe",
+        {
+            "tool": "query_loki_logs",
+            "backend": "loki",
+            "query": '{service_name="payment-service"} |= "error"',
+            "result_summary": "06:48 connection pool exhausted",
+            "hypothesis": "confirm the failure in payment logs",
+        },
+    ),
+    # a repeated probe, refused by the loop guard, to show a recoverable refusal:
+    (
+        "record_probe",
+        {
+            "tool": "query_loki_logs",
+            "backend": "loki",
+            "query": '{service_name="payment-service"} |= "error"',
+            "result_summary": "(repeat)",
+        },
+    ),
     ("advance_phase", {"to": "diagnose", "rationale": "payment-service leads the 5xx rate"}),
     ("advance_phase", {"to": "verify", "rationale": "metrics and logs agree on payment-service"}),
-    ("query_metrics", {"promql": 'sum by (job,status) (rate(http_requests_total[5m]))'}),
+    (
+        "record_probe",
+        {
+            "tool": "tempo_traceql-search",
+            "backend": "tempo",
+            "query": '{resource.service.name="payment-service"}',
+            "result_summary": "trace 6d4c1be shows a long pool-acquire wait",
+            "hypothesis": "trace evidence for the failing path",
+        },
+    ),
     (
         "conclude",
         {
@@ -64,7 +101,7 @@ _WALK: list[tuple[str, dict[str, Any]]] = [
             "root_cause": "connection pool exhaustion around 06:48",
             "final_answer": (
                 "Primary payment-service exhausted its connection pool around 06:48; "
-                "order-service cascaded downstream. Metrics and logs agree on the timing."
+                "order-service cascaded downstream. Metrics, logs, and a trace agree."
             ),
         },
     ),
