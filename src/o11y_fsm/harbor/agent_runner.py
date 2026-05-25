@@ -407,6 +407,8 @@ async def run_agent() -> None:
         current_time=scenario_clock_iso(), statement=statement
     )
     litellm.suppress_debug_info = True
+    _temp_env = os.environ.get("TEMPERATURE")
+    temperature = float(_temp_env) if _temp_env else None
 
     agent_dir = Path("/logs/agent")
     agent_dir.mkdir(parents=True, exist_ok=True)
@@ -433,9 +435,21 @@ async def run_agent() -> None:
             ]
 
             async def complete(msgs: list[dict[str, Any]]) -> Any:
-                resp = await litellm.acompletion(
-                    model=model, messages=msgs, tools=FSM_TOOLS, tool_choice="auto"
-                )
+                # tool_choice="required": in a single-surface FSM the only way to
+                # finish is conclude(), so an empty (no-tool) turn is always a
+                # defect; force a call and detect termination via fsm_terminated.
+                # Leave temperature at the provider default unless TEMPERATURE is
+                # set: some variance is needed so the model varies a refused probe
+                # instead of repeating it against the loop guard.
+                kwargs: dict[str, Any] = {
+                    "model": model,
+                    "messages": msgs,
+                    "tools": FSM_TOOLS,
+                    "tool_choice": "required",
+                }
+                if temperature is not None:
+                    kwargs["temperature"] = temperature
+                resp = await litellm.acompletion(**kwargs)
                 u = cast(Any, resp).usage
                 if u:
                     stats["input"] += getattr(u, "prompt_tokens", 0) or 0
