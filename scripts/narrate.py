@@ -40,16 +40,30 @@ def _model_display(model: str) -> str:
     return model.split("/")[-1]
 
 
-# Rose Pine
-BASE = "#191724"
-TEXT = "#e0def4"
-MUTED = "#908caa"
-LOVE = "#eb6f92"
-GOLD = "#f6c177"
-ROSE = "#ebbcba"
-PINE = "#31748f"
-FOAM = "#9ccfd8"
-IRIS = "#c4a7e7"
+LIGHT = os.environ.get("THD_LIGHT") == "1"  # light-palette render (for the light hero gif)
+
+if LIGHT:
+    # v14 light palette: ink on paper, deep-purple accent, mid-tone stages.
+    BASE = "#fafafa"  # chip text (light) on the mid-tone phase colour
+    TEXT = "#0a0a0a"
+    MUTED = "#7a7a76"
+    LOVE = "#b4637a"
+    GOLD = "#c47d10"
+    ROSE = "#7a3c4a"
+    PINE = "#573e8a"
+    FOAM = "#3d7a86"
+    IRIS = "#6e54a6"
+else:
+    # Rose Pine (dark)
+    BASE = "#191724"
+    TEXT = "#e0def4"
+    MUTED = "#908caa"
+    LOVE = "#eb6f92"
+    GOLD = "#f6c177"
+    ROSE = "#ebbcba"
+    PINE = "#31748f"
+    FOAM = "#9ccfd8"
+    IRIS = "#c4a7e7"
 
 PHASE_COLOR = {"triage": FOAM, "diagnose": IRIS, "verify": GOLD, "conclude": PINE}
 SKIP = {"list_datasources"}  # pure discovery; not part of the story
