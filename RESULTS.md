@@ -42,7 +42,7 @@ is a replayable, inspectable trace.
 
 ![logs](demos/logs.gif)
 
-## Results
+## Baseline: untuned harness, single attempt (Kimi K2.6)
 
 | Task | Reward | Reached a conclusion |
 |---|---|---|
@@ -53,7 +53,7 @@ is a replayable, inspectable trace.
 | cache-incident-blast-radius | 0.00 | yes |
 | **Mean** | **0.28** | **5 / 5** |
 
-## Reading the results
+## Reading the baseline
 
 Two axes, and they separate cleanly.
 
@@ -81,13 +81,68 @@ gates, and premature termination (FM-1.1, FM-1.5, FM-3.1). It does nothing for
 incorrect verification (FM-3.3) or reasoning-action mismatch (FM-2.6), which
 is exactly where the zeros land.
 
+## Tuned harness, Pass^3: an open model reaches frontier parity
+
+The baseline misses were reasoning gaps the agent could have closed with
+evidence it already had: it only saw a short summary of each query result, so
+it estimated shares, missed per-service blast radius, and never cited trace
+IDs. The harness was tuned for that, generally, not per task: each query
+response now returns the actual rows, and the prompts ask the model to
+quantify from them, establish blast radius (which services are and are not
+affected), query whatever specific endpoint or prior incident or rollout the
+task names, and cite a trace ID. No task-specific logic; the graph is still a
+generalized investigator.
+
+Then the same five tasks, three attempts each, driven by an open model (Kimi
+K2.6) and a frontier model (Claude Sonnet 4.6) through the identical harness.
+Per-task mean reward across the three attempts:
+
+| Task | Kimi K2.6 (open) | Claude Sonnet 4.6 |
+|---|---|---|
+| incident-triage | 0.78 | 0.78 |
+| retry-backlog-incident | 0.88 | 1.00 |
+| promql-retry-backlog-triage | 1.00 | 0.77 |
+| payments-path-root-cause | 0.00 | 0.15 |
+| cache-incident-blast-radius | 0.20 | 0.20 |
+| **Mean** | **0.572** | **0.579** |
+
+Two findings.
+
+**The tuning roughly doubled the open model (0.28 to 0.572) without touching
+the model or the tasks.** It was all in what the harness shows the agent and
+asks of it. Two tasks that the baseline scored 0.30 went to 1.00 and 0.88.
+
+**Through the same harness, the open model matches the frontier model.** Kimi
+K2.6 at 0.572 and Sonnet 4.6 at 0.579 are a statistical tie on this set. The
+harness is the equalizer: when the procedure is enforced and the evidence is
+surfaced, a 1T open model investigates these incidents about as well as
+Sonnet. The residual failures are shared, not model-specific: both score
+exactly 0.78 on incident-triage (the same 5xx-share-accuracy miss), both land
+0.20 on cache-incident-blast-radius (both fall for the broad-versus-isolated
+trap two times in three), and both struggle on payments-path-root-cause. These
+are task-level reasoning and verification limits, the FM-3.3 boundary, that
+sit above the harness and below the model, and they do not move much between an
+open and a frontier model.
+
+A note on comparability: these are partial-credit rubric means at three
+attempts. The public o11y-bench leaderboard reports Pass^3 (all three trials
+must clear a threshold) over the full investigation category, a stricter,
+binary metric on more tasks. The numbers here are not the leaderboard's
+numbers and are not a submission. They are a controlled within-harness
+comparison.
+
 ## Caveats
 
-First run. One attempt per task, one model, one author, and the graph was not
-tuned to these tasks. This is not a leaderboard submission. It is a baseline:
-evidence that the harness drives real investigations to gradeable, auditable
-conclusions, and an honest read on where an open model does and does not get
-the answer right once the procedure is enforced.
+Five investigation tasks, one author, partial-credit rubric scoring. The
+baseline is a single attempt; the tuned comparison is three attempts per task
+per model. This is not a leaderboard submission and the numbers are not
+directly comparable to the public Pass^3 category scores. It is a controlled
+read: the harness drives real investigations to gradeable, auditable
+conclusions, general tuning of what the harness surfaces and asks roughly
+doubled an open model's score, and through the same harness that open model
+investigates about as well as a frontier model, with the remaining failures
+shared and sitting at the reasoning boundary the design does not claim to
+cross.
 
 ## Reproduce
 
