@@ -161,21 +161,12 @@ class O11yFSMAgent(BaseAgent):
             )
         except Exception as exc:  # noqa: BLE001
             self.logger.warning(f"trajectory download failed: {exc}")
-        try:
+        with contextlib.suppress(Exception):
             await environment.download_file(
                 source_path="/logs/agent/final_answer.txt",
                 target_path=self.logs_dir / "final_answer.txt",
             )
-            final_answer = (self.logs_dir / "final_answer.txt").read_text(encoding="utf-8")
-        except Exception as exc:  # noqa: BLE001
-            self.logger.warning(f"final_answer download failed: {exc}")
-            final_answer = ""
-
-        # Surface the FSM's final_answer to Harbor's grading context.
-        # The verifier reads either context.final_answer or the agent's
-        # accumulated transcript; setting both gives us belt + suspenders.
-        if final_answer.strip():
-            with contextlib.suppress(AttributeError):
-                context.final_answer = final_answer
-            with contextlib.suppress(AttributeError):
-                context.add_assistant_message(final_answer)
+        # The verifier reads the response from the downloaded trajectory.json
+        # (ATIF format) via grading/transcript_parser.py, so the runner records
+        # the conversation and the final answer there. Nothing to set on the
+        # AgentContext (it has no final_answer field).

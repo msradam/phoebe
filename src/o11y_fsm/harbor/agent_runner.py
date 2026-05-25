@@ -317,6 +317,52 @@ async def step_fsm(app: Any, action: str, inputs: dict[str, Any]) -> dict[str, A
     }
 
 
+def atif_steps_from_messages(
+    messages: list[dict[str, Any]], final_answer: str = ""
+) -> list[dict[str, Any]]:
+    """Convert the OpenAI-style message list into ATIF steps that o11y-bench's
+    transcript parser reads (source / message / tool_calls / observation). Tool
+    results attach to the preceding agent step as observations, and the final
+    answer is appended as the agent's closing message so the grader sees it."""
+    steps: list[dict[str, Any]] = []
+    for m in messages:
+        role = m.get("role")
+        if role in ("user", "system"):
+            steps.append({"source": role, "message": m.get("content") or ""})
+        elif role == "assistant":
+            tool_calls = []
+            for tc in m.get("tool_calls") or []:
+                fn = tc.get("function", {})
+                args = fn.get("arguments")
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        args = {"_raw": args}
+                tool_calls.append(
+                    {
+                        "tool_call_id": tc.get("id", ""),
+                        "function_name": fn.get("name", ""),
+                        "arguments": args,
+                    }
+                )
+            steps.append(
+                {
+                    "source": "agent",
+                    "message": (m.get("content") or "") or ("(tool use)" if tool_calls else ""),
+                    "tool_calls": tool_calls,
+                }
+            )
+        elif role == "tool" and steps and steps[-1].get("source") == "agent":
+            obs = steps[-1].setdefault("observation", {"results": []})
+            obs["results"].append(
+                {"source_call_id": m.get("tool_call_id", ""), "content": str(m.get("content", ""))}
+            )
+    if final_answer:
+        steps.append({"source": "agent", "message": final_answer})
+    return steps
+
+
 def fsm_terminated(app: Any) -> bool:
     try:
         return app.state.get("final_answer") not in (None, "")
@@ -478,12 +524,14 @@ async def run_agent() -> None:
                         final_answer = m["content"]
                         break
             (agent_dir / "final_answer.txt").write_text(final_answer or "")
+            atif_steps = atif_steps_from_messages(messages, final_answer)
 
     traj = {
         "schema_version": "ATIF-v1.7",
         "session_id": str(uuid.uuid4()),
         "agent": {"name": "o11y-fsm", "version": "0.1.0", "model_name": model},
-        "steps": steps_log,
+        "steps": atif_steps,
+        "compact_steps": steps_log,
         "final_metrics": {
             "total_prompt_tokens": stats["input"],
             "total_completion_tokens": stats["output"],

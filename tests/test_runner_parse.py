@@ -10,7 +10,11 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from o11y_fsm.harbor.agent_runner import assistant_message, extract_tool_calls
+from o11y_fsm.harbor.agent_runner import (
+    assistant_message,
+    atif_steps_from_messages,
+    extract_tool_calls,
+)
 
 
 def _structured(name: str, arguments: str, call_id: str = "c0"):
@@ -64,6 +68,37 @@ def test_no_calls_returns_empty():
     assert (
         extract_tool_calls(SimpleNamespace(content="just prose, no tools", tool_calls=None)) == []
     )
+
+
+def test_atif_steps_surface_response_and_evidence():
+    # The o11y-bench transcript parser only reads steps with a "source" field,
+    # and grades the response text. Confirm the conversation converts and the
+    # final answer + tool evidence are present.
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "investigate"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "query_metrics", "arguments": '{"promql": "up"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": '{"rows": 3, "job": "payment-service"}'},
+    ]
+    steps = atif_steps_from_messages(messages, final_answer="payment-service is primary; 5xx 3%.")
+    sources = [s["source"] for s in steps]
+    assert sources == ["system", "user", "agent", "agent"]
+    # the agent tool step carries the call and the tool result as an observation
+    agent_step = steps[2]
+    assert agent_step["tool_calls"][0]["function_name"] == "query_metrics"
+    assert agent_step["observation"]["results"][0]["source_call_id"] == "c1"
+    # the final answer is the closing agent message the grader reads
+    assert steps[-1]["message"] == "payment-service is primary; 5xx 3%."
 
 
 def test_assistant_message_strips_leaked_tokens_from_content():
