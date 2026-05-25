@@ -23,4 +23,4 @@ Type "python scripts/narrate.py scripts/hero_trace_sonnet.json"
 Enter
 Sleep 1500ms
 Show
-Sleep 14s
+Sleep 27s

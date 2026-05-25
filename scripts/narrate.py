@@ -123,7 +123,7 @@ def main() -> None:
         )
     )
     console.print()
-    pause(1.6)
+    pause(2.2)
 
     phase = "triage"
     for st in steps:
@@ -143,7 +143,7 @@ def main() -> None:
                     wrapped[-1] = wrapped[-1].rstrip(".") + " …"
                 console.print(Text("\n".join(wrapped), style=f"italic {MUTED}"))
             console.print()
-            pause(1.5)
+            pause(2.4)
             continue
 
         refused = st.get("status", "ok") != "ok"
@@ -165,9 +165,9 @@ def main() -> None:
                 tail,
             )
         )
-        pause(0.8)
+        pause(1.3)
 
-    pause(0.7)
+    pause(1.2)
     primary = trace.get("primary_service") or "?"
     root = " ".join((trace.get("root_cause") or "").split())
     console.print(
@@ -185,6 +185,7 @@ def main() -> None:
         )
     )
     console.print()
+    pause(3.0)  # let the conclusion rest on screen at the end of the recording
 
 
 if __name__ == "__main__":

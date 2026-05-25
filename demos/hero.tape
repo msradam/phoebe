@@ -25,4 +25,4 @@ Type "python scripts/narrate.py"
 Enter
 Sleep 1500ms
 Show
-Sleep 16s
+Sleep 30s
