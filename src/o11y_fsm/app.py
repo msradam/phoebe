@@ -1,14 +1,13 @@
-"""o11y-fsm Burr Application: SRE incident investigation over Grafana, via burrmcp upstream.
+"""o11y-fsm Burr Application: SRE incident investigation over Grafana, via Theodosia upstream.
 
-Design (v0.5): single surface. The agent sees ONLY the FSM's actions. The
-query actions drive Grafana's MCP server THROUGH burrmcp
-(``call_upstream("grafana", ...)``): the FSM owns the Grafana plumbing
-(datasource discovery, time windows, query types) and exposes a clean
-``query_metrics(promql)`` / ``query_logs(logql)`` / ``query_traces(traceql)``
-to the agent. Every query happens inside an action, so it advances state
-(ledger). This is the v0.2 single-surface design that drove reliably on a
-70B model, re-expressed through burrmcp's general ``upstream`` feature
-(no bespoke client, exact Grafana arg shapes, works with the real server).
+Single surface: the agent sees ONLY the FSM's actions. The query actions
+drive Grafana's MCP server through Theodosia (``call_upstream("grafana",
+...)``): the FSM owns the Grafana plumbing (datasource discovery, time
+windows, query types) and exposes a clean ``query_metrics(promql)`` /
+``query_logs(logql)`` / ``query_traces(traceql)`` to the agent. Every query
+happens inside an action, so it advances state (ledger). Driving the
+telemetry through the FSM action, rather than a separate query surface, is
+what lets a mid-size model walk the investigation to a conclusion.
 
 Phases (state variable): triage -> diagnose -> verify.
 Actions: start_investigation, query_metrics, query_logs, query_traces,
@@ -26,7 +25,7 @@ from typing import Any
 
 from burr.core import ApplicationBuilder, State, action
 from burr.core.action import Condition
-from burrmcp import call_upstream
+from theodosia import call_upstream
 
 from o11y_fsm import prompts
 
@@ -158,7 +157,7 @@ async def start_investigation(
             "loki": _pick_uid(ds, "loki"),
             "tempo": _pick_uid(ds, "tempo"),
         }
-    except Exception as e:  # noqa: BLE001 — surface as recoverable state, not a crash
+    except Exception as e:  # noqa: BLE001 (surface as recoverable state, not a crash)
         uids = {"prometheus": None, "loki": None, "tempo": None, "_error": str(e)}
     return state.update(
         incident_description=incident_description.strip(),
@@ -193,7 +192,7 @@ async def start_investigation(
 async def query_metrics(
     state: State[Any], promql: str, hypothesis: str | None = None
 ) -> State[Any]:
-    """Run a PromQL query against Grafana (through burrmcp) and record it.
+    """Run a PromQL query against Grafana (through Theodosia) and record it.
 
     Args:
         promql: the PromQL expression.
@@ -235,7 +234,7 @@ async def query_metrics(
     writes=["findings", "distinct_backends", "recent_probe_hashes", "current_prompt", "log"],
 )
 async def query_logs(state: State[Any], logql: str, hypothesis: str | None = None) -> State[Any]:
-    """Run a LogQL query against Grafana (through burrmcp) and record it.
+    """Run a LogQL query against Grafana (through Theodosia) and record it.
 
     Args:
         logql: the LogQL query.
@@ -276,7 +275,7 @@ async def query_logs(state: State[Any], logql: str, hypothesis: str | None = Non
 async def query_traces(
     state: State[Any], traceql: str, hypothesis: str | None = None
 ) -> State[Any]:
-    """Run a TraceQL search against Grafana (through burrmcp) and record it.
+    """Run a TraceQL search against Grafana (through Theodosia) and record it.
 
     Args:
         traceql: the TraceQL query.
@@ -419,9 +418,9 @@ def build_application(tracking: bool = True):
         .with_transitions(*_hub_transitions())
     )
     if tracking:
-        from burr.tracking.client import LocalTrackingClient
+        from theodosia import tracker
 
-        builder = builder.with_tracker(LocalTrackingClient(project=_TRACKER_PROJECT))
+        builder = builder.with_tracker(tracker(project=_TRACKER_PROJECT))
     return (
         builder.with_state(
             incident_description="",
@@ -445,7 +444,7 @@ def build_application(tracking: bool = True):
 
 
 def build_server(grafana_mcp_url: str | None = None):
-    """Mount o11y-fsm, driving Grafana through burrmcp upstream (single surface).
+    """Mount o11y-fsm, driving Grafana through Theodosia upstream (single surface).
 
     Args:
         grafana_mcp_url: URL of the Grafana MCP server to drive. Defaults to
@@ -454,7 +453,7 @@ def build_server(grafana_mcp_url: str | None = None):
     """
     import os
 
-    from burrmcp import ServingMode, mount
+    from theodosia import ServingMode, mount
 
     url = grafana_mcp_url or os.environ.get("GRAFANA_MCP_URL", "http://127.0.0.1:8080/mcp")
     return mount(

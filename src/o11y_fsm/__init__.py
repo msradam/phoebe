@@ -1,18 +1,17 @@
-"""o11y-fsm: SRE incident-investigation FSM, mounted as MCP via BurrMCP.
+"""o11y-fsm: SRE incident-investigation FSM, mounted as MCP via Theodosia.
 
-Walks the standard observability methodology as enforced phases:
+Single surface: the agent sees only the FSM's actions. The query actions
+run telemetry queries against Grafana (through Theodosia's upstream
+mechanism) and record evidence in the same step, so the operation is the
+FSM action. Phase is a state variable; methodology gating lives in the
+action bodies.
 
     start_investigation
-      -> survey_telemetry
-        -> gather_evidence  (loops; requires >=2 distinct backends)
-          -> correlate
-            -> form_hypothesis
-              -> verify_or_revise  (may loop back to form_hypothesis)
-                -> recommend_next_steps   [terminal]
+      query_metrics(promql) / query_logs(logql) / query_traces(traceql)
+      advance_phase(to, rationale)   triage -> diagnose -> verify
+      conclude(primary_service, root_cause, final_answer, cascade_services)
 
-Designed for the o11y-bench task shape (Grafana + Prometheus + Loki + Tempo)
-but the FSM is backend-agnostic; the agent talks to whatever MCP tools are
-available in its environment.
+Built for the o11y-bench task shape (Grafana + Prometheus + Loki + Tempo).
 """
 
 from o11y_fsm.app import build_application, build_server

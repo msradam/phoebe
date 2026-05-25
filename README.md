@@ -1,6 +1,6 @@
 # o11y-fsm
 
-An observability / SRE incident-investigation finite-state machine for LLM-driven agents. Mounts as an MCP server via [`burrmcp`](https://github.com/msradam/burrmcp); ships a [Harbor](https://harborframework.com/) agent for running against [Grafana's o11y-bench](https://github.com/grafana/o11y-bench).
+An observability / SRE incident-investigation finite-state machine for LLM-driven agents. Mounts as an MCP server via [`theodosia`](https://github.com/msradam/theodosia); ships a [Harbor](https://harborframework.com/) agent for running against [Grafana's o11y-bench](https://github.com/grafana/o11y-bench).
 
 ```text
 start_investigation
@@ -13,12 +13,12 @@ start_investigation
 
 Hub topology: every operational action is reachable from every other. The methodology is enforced inside action bodies, not by narrowing the graph (this is what makes a mid-size model able to *drive* the FSM instead of fighting it). `conclude` is gated: phase must be `verify`, you need probes from ≥2 distinct backends, and at least one probe must have run during the verify phase. A repeated identical probe is refused ("vary the probe").
 
-The design follows the pattern proven in a sibling project (circe): **the operation is the FSM action.** There is no separate "do work here, record it there" surface; calling `query_metrics` runs the query and advances state in one step. State + audit trail live on the server.
+The design follows the pattern proven in a sibling project (circe): the operation is the FSM action. There is no separate "do work here, record it there" surface; calling `query_metrics` runs the query and advances state in one step. State and audit trail live on the server.
 
 ## What it gives the caller
 
 - **Phase enforcement at the protocol layer.** The agent cannot jump from `start_investigation` to `recommend_next_steps`. Cannot correlate before evidence from ≥2 backends. Cannot finalize before verifying.
-- **Auditable trail.** Every step is a row in Burr's tracker (`~/.burr/o11y-fsm/<app_id>/log.jsonl`). Replayable, forkable, diffable. Tail it with `burrmcp sessions tail`.
+- **Auditable trail.** Every step is a row in Burr's tracker (`~/.theodosia/o11y-fsm/<app_id>/log.jsonl`). Replayable, forkable, diffable. Tail it with `theodosia watch --project o11y-fsm`.
 - **Backend-agnostic.** The FSM doesn't know about Prometheus or Loki. The caller LLM runs the actual queries (against whatever MCP tools its environment exposes) and reports findings back via the next FSM step.
 
 ## Install
@@ -42,10 +42,10 @@ server = build_server()
 server.run()  # serves over stdio MCP
 ```
 
-Or via the burrmcp CLI:
+Or via the theodosia CLI:
 
 ```bash
-burrmcp serve o11y_fsm.app:build_application --name o11y-fsm
+theodosia serve o11y_fsm.app:build_application --name o11y-fsm
 ```
 
 ## Use on o11y-bench
@@ -100,4 +100,4 @@ Apache 2.0.
 
 ## Notice
 
-`o11y-fsm` is independent open-source work by Adam Munawar Rahman and does not represent the views, positions, or technology roadmap of IBM Corporation or any other employer. It is built on [Apache Burr](https://github.com/apache/burr) and [burrmcp](https://github.com/msradam/burrmcp); references to Grafana's [o11y-bench](https://github.com/grafana/o11y-bench) are for integration purposes and do not imply endorsement.
+`o11y-fsm` is independent open-source work by Adam Munawar Rahman and does not represent the views, positions, or technology roadmap of IBM Corporation or any other employer. It is built on [Apache Burr](https://github.com/apache/burr) and [theodosia](https://github.com/msradam/theodosia); references to Grafana's [o11y-bench](https://github.com/grafana/o11y-bench) are for integration purposes and do not imply endorsement.

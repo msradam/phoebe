@@ -9,3 +9,6 @@ build/
 .mypy_cache/
 jobs/
 .burr/
+.theodosia/
+.env
+.env.*

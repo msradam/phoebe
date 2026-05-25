@@ -10,22 +10,24 @@
 # litellm is >=1.84 (not the 1.83.10 the default o11y agent pins): fastmcp
 # requires python-dotenv>=1.1.0, which litellm 1.83.10 hard-pins to 1.0.1.
 # 1.84+ relaxes that, letting fastmcp + litellm coexist in one env.
-# Note: burrmcp is not on PyPI; its source is vendored into /app/burrmcp
-# by the Harbor agent's setup(). /app is on sys.path, so `import burrmcp`
-# resolves to the vendored copy.
-"""o11y-fsm agent runner (v0.5, single-surface via burrmcp upstream) — Harbor container.
+# Note: theodosia's source is vendored into /app/theodosia by the Harbor
+# agent's setup() (its apache-burr[tracking] extra pulls psutil, which has
+# no wheel for the gcc-less image). /app is on sys.path, so
+# `import theodosia` resolves to the vendored copy.
+"""o11y-fsm agent runner (single-surface via Theodosia upstream), Harbor container.
 
 The agent sees ONLY the o11y-fsm actions. The query actions drive Grafana
-THROUGH burrmcp's upstream mechanism: the runner binds an upstream manager
+through Theodosia's upstream mechanism: the runner binds an upstream manager
 that wraps its Grafana MCP session, so call_upstream("grafana", tool, args)
 inside an FSM action reaches Grafana. The Grafana tools are never exposed
-to the agent. Every query happens inside an action -> single surface,
-ledger-honest -> drives reliably even on a 70B model.
+to the agent. Every query happens inside an action, so it is a single,
+ledger-honest surface that drives reliably even on a 70B model.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import sys
@@ -36,7 +38,7 @@ from typing import Any, cast
 
 sys.path.insert(0, "/app")
 
-from burrmcp.upstream import bind_upstream  # noqa: E402
+from theodosia.upstream import bind_upstream  # noqa: E402
 
 from o11y_fsm import build_application  # noqa: E402
 
@@ -79,7 +81,7 @@ def _extract(res: Any) -> Any:
 
 
 class _SessionUpstream:
-    """Bind the runner's open Grafana MCP session as a burrmcp upstream, so
+    """Bind the runner's open Grafana MCP session as a Theodosia upstream, so
     the FSM's call_upstream('grafana', tool, args) routes to it."""
 
     def __init__(self, session: Any):
@@ -250,8 +252,6 @@ def fsm_terminated(app: Any) -> bool:
         return False
 
 
-SYSTEM_PROMPT = Path("/app/system_prompt.txt").read_text(encoding="utf-8")
-TASK_PROMPT_TEMPLATE = Path("/app/task_prompt.txt").read_text(encoding="utf-8")
 MAX_STEPS = 50
 
 
@@ -263,8 +263,10 @@ async def run_agent() -> None:
     model = normalize_model_name(os.environ["MODEL"])
     stack_host = os.environ.get("STACK_HOST", "127.0.0.1")
     mcp_url = os.environ.get("MCP_URL", f"http://{stack_host}:8080/mcp")
+    system_prompt = Path("/app/system_prompt.txt").read_text(encoding="utf-8")
+    task_prompt_template = Path("/app/task_prompt.txt").read_text(encoding="utf-8")
     statement = Path("/app/instruction.txt").read_text(encoding="utf-8").strip()
-    task_prompt = TASK_PROMPT_TEMPLATE.format(
+    task_prompt = task_prompt_template.format(
         current_time=scenario_clock_iso(), statement=statement
     )
     litellm.suppress_debug_info = True
@@ -281,7 +283,7 @@ async def run_agent() -> None:
     print(
         f"Connecting to Grafana MCP at {mcp_url} (bound as upstream; not exposed to the agent)..."
     )
-    async with streamable_http_client(mcp_url) as (read, write, _):
+    async with streamable_http_client(mcp_url) as (read, write, _):  # noqa: SIM117 (keep the session block at its own indent for readability)
         async with ClientSession(read, write) as session:
             await session.initialize()
             # Bind Grafana as the FSM's upstream. The agent never sees these tools.
@@ -289,7 +291,7 @@ async def run_agent() -> None:
             print("Grafana bound as upstream. Agent surface = FSM actions only (single surface).")
 
             messages: list[dict[str, Any]] = [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": task_prompt},
             ]
             step = 0
@@ -305,10 +307,8 @@ async def run_agent() -> None:
                 if u:
                     stats["input"] += getattr(u, "prompt_tokens", 0) or 0
                     stats["output"] += getattr(u, "completion_tokens", 0) or 0
-                try:
+                with contextlib.suppress(Exception):
                     stats["cost"] += litellm.completion_cost(completion_response=resp) or 0.0
-                except Exception:
-                    pass
                 if not tool_calls:
                     steps_log.append(
                         {"step": step, "type": "assistant", "content": msg.content or ""}
@@ -341,10 +341,8 @@ async def run_agent() -> None:
             print("done")
 
             final_answer = ""
-            try:
+            with contextlib.suppress(Exception):
                 final_answer = fsm_app.state.get("final_answer") or ""
-            except Exception:
-                pass
             if not final_answer:
                 for m in reversed(messages):
                     if m.get("role") == "assistant" and m.get("content"):
@@ -355,7 +353,7 @@ async def run_agent() -> None:
     traj = {
         "schema_version": "ATIF-v1.7",
         "session_id": str(uuid.uuid4()),
-        "agent": {"name": "o11y-fsm", "version": "0.5.0", "model_name": model},
+        "agent": {"name": "o11y-fsm", "version": "0.1.0", "model_name": model},
         "steps": steps_log,
         "final_metrics": {
             "total_prompt_tokens": stats["input"],

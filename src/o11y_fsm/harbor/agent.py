@@ -2,11 +2,13 @@
 
 The agent_runner.py + the o11y_fsm package source are uploaded into
 the container at /app/. The runner uses uv's PEP 723 inline-script
-dep declaration to install burrmcp + litellm + mcp on first run.
+dep declaration to install apache-burr + fastmcp + litellm + mcp on
+first run; theodosia source is vendored alongside o11y_fsm into /app.
 """
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shlex
 from pathlib import Path
@@ -22,7 +24,7 @@ RUNNER_SCRIPT = HARBOR_DIR / "agent_runner.py"
 SYSTEM_PROMPT = HARBOR_DIR / "system_prompt.txt"
 TASK_PROMPT = HARBOR_DIR / "task_prompt.txt"
 # We upload the entire o11y_fsm package source so the runner can `import o11y_fsm`
-# (its PEP 723 deps already install burrmcp, fastmcp, apache-burr, etc.).
+# (its PEP 723 deps install fastmcp, apache-burr, etc.; theodosia is vendored).
 PACKAGE_ROOT = HARBOR_DIR.parent  # .../src/o11y_fsm
 VIEWER_COMMAND_STDOUT_PATH = "/logs/agent/command-0/stdout.txt"
 
@@ -56,8 +58,9 @@ def _build_runner_command() -> str:
 
 class O11yFSMAgent(BaseAgent):
     """Harbor agent that walks the o11y-fsm Burr application inside the
-    bench container, exposing both Grafana MCP tools and an in-process
-    ``advance_workflow`` tool to the caller LLM.
+    bench container. Single surface: the caller LLM sees only the FSM
+    actions. Grafana is bound as a Theodosia upstream and reached from
+    inside the query actions; its tools are never exposed to the LLM.
     """
 
     def __init__(
@@ -89,14 +92,16 @@ class O11yFSMAgent(BaseAgent):
             source_path=SYSTEM_PROMPT, target_path="/app/system_prompt.txt"
         )
         await environment.upload_file(source_path=TASK_PROMPT, target_path="/app/task_prompt.txt")
-        # Vendor both packages' source into the container. Neither o11y_fsm
-        # nor burrmcp is on PyPI, so the runner imports them from /app.
-        # Create every needed subdir first (rglob hits nested packages like
-        # burrmcp/_experimental), then upload.
-        import burrmcp as _bm
+        # Vendor both packages' source into the container. o11y_fsm is not on
+        # PyPI; theodosia is, but its apache-burr[tracking] extra pulls psutil,
+        # which has no prebuilt wheel for the gcc-less bench image, so we vendor
+        # theodosia's source and the runner's PEP 723 deps pin apache-burr
+        # without [tracking]. Create every needed subdir first (rglob hits
+        # nested packages like theodosia/_experimental), then upload.
+        import theodosia as _th
 
         await self._upload_package(environment, PACKAGE_ROOT, "/app/o11y_fsm")
-        await self._upload_package(environment, Path(_bm.__file__).parent, "/app/burrmcp")
+        await self._upload_package(environment, Path(_th.__file__).parent, "/app/theodosia")
 
     @staticmethod
     async def _upload_package(environment: BaseEnvironment, root: Path, dest: str) -> None:
@@ -170,11 +175,7 @@ class O11yFSMAgent(BaseAgent):
         # The verifier reads either context.final_answer or the agent's
         # accumulated transcript; setting both gives us belt + suspenders.
         if final_answer.strip():
-            try:
+            with contextlib.suppress(AttributeError):
                 context.final_answer = final_answer
-            except AttributeError:
-                pass
-            try:
+            with contextlib.suppress(AttributeError):
                 context.add_assistant_message(final_answer)
-            except AttributeError:
-                pass

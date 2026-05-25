@@ -1,4 +1,4 @@
-"""o11y-fsm v0.5: single surface, drives Grafana through burrmcp upstream.
+"""o11y-fsm: single surface, drives Grafana through Theodosia upstream.
 
 The query actions call call_upstream("grafana", ...); tests bind a mock
 upstream so no real Grafana is needed. Phase is a state variable; gating
@@ -11,9 +11,9 @@ import json
 from typing import Any
 
 import pytest
-from burrmcp import ServingMode, mount
-from burrmcp.upstream import bind_upstream, reset_upstream
 from fastmcp import Client
+from theodosia import ServingMode, mount
+from theodosia.upstream import bind_upstream, reset_upstream
 
 from o11y_fsm.app import build_application
 
@@ -185,7 +185,7 @@ async def test_history_records_steps():
     async with Client(build_server()) as client:
         await _start(client)
         await _two_backends(client)
-        history = json.loads((await client.read_resource("burr://history"))[0].text)
+        history = json.loads((await client.read_resource("theodosia://history"))[0].text)
         assert [h["action"] for h in history] == [
             "start_investigation",
             "query_metrics",

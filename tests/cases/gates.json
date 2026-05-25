@@ -1,0 +1,170 @@
+[
+  {
+    "action": "advance_phase",
+    "name": "diagnose_needs_a_finding",
+    "input_state": {
+      "_action": "advance_phase",
+      "_inputs": {"to": "diagnose", "rationale": "have a lead"},
+      "phase": "triage",
+      "findings": [],
+      "phase_history": [],
+      "log": []
+    },
+    "expected_state": {"error_contains": "at least 1 finding"}
+  },
+  {
+    "action": "advance_phase",
+    "name": "verify_needs_two_backends",
+    "input_state": {
+      "_action": "advance_phase",
+      "_inputs": {"to": "verify", "rationale": "confirm"},
+      "phase": "diagnose",
+      "findings": [{"backend": "prometheus", "phase": "triage"}],
+      "phase_history": [],
+      "log": []
+    },
+    "expected_state": {"error_contains": "distinct backends"}
+  },
+  {
+    "action": "advance_phase",
+    "name": "rejects_unknown_phase",
+    "input_state": {
+      "_action": "advance_phase",
+      "_inputs": {"to": "banana", "rationale": "x"},
+      "phase": "triage",
+      "findings": [],
+      "phase_history": [],
+      "log": []
+    },
+    "expected_state": {"error_contains": "phase must be one of"}
+  },
+  {
+    "action": "advance_phase",
+    "name": "rejects_empty_rationale",
+    "input_state": {
+      "_action": "advance_phase",
+      "_inputs": {"to": "diagnose", "rationale": "   "},
+      "phase": "triage",
+      "findings": [{"backend": "prometheus", "phase": "triage"}],
+      "phase_history": [],
+      "log": []
+    },
+    "expected_state": {"error_contains": "rationale"}
+  },
+  {
+    "action": "advance_phase",
+    "name": "verify_ok_with_two_backends",
+    "input_state": {
+      "_action": "advance_phase",
+      "_inputs": {"to": "verify", "rationale": "metrics and logs agree"},
+      "phase": "diagnose",
+      "findings": [
+        {"backend": "prometheus", "phase": "triage"},
+        {"backend": "loki", "phase": "triage"}
+      ],
+      "phase_history": [],
+      "log": []
+    },
+    "expected_state": {"phase": "verify"}
+  },
+  {
+    "action": "conclude",
+    "name": "rejects_outside_verify",
+    "input_state": {
+      "_action": "conclude",
+      "_inputs": {
+        "primary_service": "payment-service",
+        "root_cause": "connection pool exhaustion",
+        "final_answer": "Primary payment-service exhausted its connection pool; order-service cascaded. Metrics and logs agree."
+      },
+      "incident_description": "error rates jumped",
+      "phase": "diagnose",
+      "findings": [
+        {"backend": "prometheus", "phase": "verify"},
+        {"backend": "loki", "phase": "triage"}
+      ],
+      "log": []
+    },
+    "expected_state": {"error_contains": "phase=='verify'"}
+  },
+  {
+    "action": "conclude",
+    "name": "rejects_single_backend",
+    "input_state": {
+      "_action": "conclude",
+      "_inputs": {
+        "primary_service": "payment-service",
+        "root_cause": "connection pool exhaustion",
+        "final_answer": "Primary payment-service exhausted its connection pool; order-service cascaded. Metrics and logs agree."
+      },
+      "incident_description": "error rates jumped",
+      "phase": "verify",
+      "findings": [{"backend": "prometheus", "phase": "verify"}],
+      "log": []
+    },
+    "expected_state": {"error_contains": "distinct backends"}
+  },
+  {
+    "action": "conclude",
+    "name": "requires_verify_phase_finding",
+    "input_state": {
+      "_action": "conclude",
+      "_inputs": {
+        "primary_service": "payment-service",
+        "root_cause": "connection pool exhaustion",
+        "final_answer": "Primary payment-service exhausted its connection pool; order-service cascaded. Metrics and logs agree."
+      },
+      "incident_description": "error rates jumped",
+      "phase": "verify",
+      "findings": [
+        {"backend": "prometheus", "phase": "triage"},
+        {"backend": "loki", "phase": "triage"}
+      ],
+      "log": []
+    },
+    "expected_state": {"error_contains": "verify phase"}
+  },
+  {
+    "action": "conclude",
+    "name": "rejects_thin_final_answer",
+    "input_state": {
+      "_action": "conclude",
+      "_inputs": {
+        "primary_service": "payment-service",
+        "root_cause": "connection pool exhaustion",
+        "final_answer": "too short"
+      },
+      "incident_description": "error rates jumped",
+      "phase": "verify",
+      "findings": [
+        {"backend": "prometheus", "phase": "verify"},
+        {"backend": "loki", "phase": "triage"}
+      ],
+      "log": []
+    },
+    "expected_state": {"error_contains": ">=80"}
+  },
+  {
+    "action": "conclude",
+    "name": "accepts_well_formed_conclusion",
+    "input_state": {
+      "_action": "conclude",
+      "_inputs": {
+        "primary_service": "payment-service",
+        "cascade_services": ["order-service"],
+        "root_cause": "connection pool exhaustion at 14:02",
+        "final_answer": "Primary payment-service exhausted its connection pool at 14:02; order-service cascaded downstream. Metrics and logs agree."
+      },
+      "incident_description": "error rates jumped across services",
+      "phase": "verify",
+      "findings": [
+        {"backend": "prometheus", "phase": "verify"},
+        {"backend": "loki", "phase": "triage"}
+      ],
+      "log": []
+    },
+    "expected_state": {
+      "final_answer": "Primary payment-service exhausted its connection pool at 14:02; order-service cascaded downstream. Metrics and logs agree."
+    }
+  }
+]
