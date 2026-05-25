@@ -3,10 +3,10 @@
 Output demos/hero_tall.gif
 
 Set Theme "rose-pine"
-Set FontSize 19
-Set Width 720
-Set Height 640
-Set Padding 24
+Set FontSize 17
+Set Width 860
+Set Height 600
+Set Padding 28
 Set TypingSpeed 1ms
 
 Hide

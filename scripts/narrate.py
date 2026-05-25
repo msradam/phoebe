@@ -54,7 +54,7 @@ IRIS = "#c4a7e7"
 PHASE_COLOR = {"triage": FOAM, "diagnose": IRIS, "verify": GOLD, "conclude": PINE}
 SKIP = {"list_datasources"}  # pure discovery; not part of the story
 
-console = Console(width=58 if HERO else 100)
+console = Console(width=52 if HERO else 100)
 FAST = "--fast" in sys.argv
 
 
