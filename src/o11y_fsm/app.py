@@ -68,6 +68,47 @@ def _pick_uid(datasources: Any, *types: str) -> str | None:
     return None
 
 
+def _as_list(val: Any) -> list[Any]:
+    if isinstance(val, list):
+        return val
+    if isinstance(val, dict):
+        for key in ("data", "result", "values", "labels"):
+            if isinstance(val.get(key), list):
+                return val[key]
+    return []
+
+
+async def _discover_schema(uids: dict[str, Any]) -> dict[str, Any]:
+    """Pull the real metric names, label names, job values, and Loki labels
+    from Grafana so the agent queries against actual names instead of guessing.
+    Tolerant: any failed lookup is simply omitted."""
+
+    async def _safe(tool: str, args: dict[str, Any]) -> Any:
+        try:
+            return await call_upstream("grafana", tool, args)
+        except Exception:  # noqa: BLE001 (a missing lookup is not fatal)
+            return None
+
+    schema: dict[str, Any] = {}
+    prom = uids.get("prometheus")
+    loki = uids.get("loki")
+    if prom:
+        schema["metrics"] = _as_list(
+            await _safe("list_prometheus_metric_names", {"datasourceUid": prom})
+        )
+        schema["prometheus_labels"] = _as_list(
+            await _safe("list_prometheus_label_names", {"datasourceUid": prom})
+        )
+        schema["jobs"] = _as_list(
+            await _safe("list_prometheus_label_values", {"datasourceUid": prom, "labelName": "job"})
+        )
+    if loki:
+        schema["loki_labels"] = _as_list(
+            await _safe("list_loki_label_names", {"datasourceUid": loki})
+        )
+    return schema
+
+
 def _distinct_backends(findings: list[dict[str, Any]]) -> set[str]:
     return {f["backend"] for f in findings if f.get("backend")}
 
@@ -131,6 +172,7 @@ def _loop_guard(state: State[Any], backend: str, query: str) -> None:
         "distinct_backends",
         "recent_probe_hashes",
         "ds_uids",
+        "schema",
         "window",
         "hypothesis",
         "final_answer",
@@ -159,6 +201,7 @@ async def start_investigation(
         }
     except Exception as e:  # noqa: BLE001 (surface as recoverable state, not a crash)
         uids = {"prometheus": None, "loki": None, "tempo": None, "_error": str(e)}
+    schema = await _discover_schema(uids)
     return state.update(
         incident_description=incident_description.strip(),
         scenario_time=scenario_time,
@@ -168,11 +211,12 @@ async def start_investigation(
         distinct_backends=[],
         recent_probe_hashes=[],
         ds_uids=uids,
+        schema=schema,
         window={"start": start, "end": end},
         hypothesis=None,
         final_answer=None,
         investigation_summary=None,
-        current_prompt=prompts.after_start(incident_description.strip(), scenario_time),
+        current_prompt=prompts.after_start(incident_description.strip(), scenario_time, schema),
         log=[f"investigation started; datasources={ {k: bool(v) for k, v in uids.items()} }"],
     )
 
@@ -431,6 +475,7 @@ def build_application(tracking: bool = True):
             distinct_backends=[],
             recent_probe_hashes=[],
             ds_uids={},
+            schema={},
             window={},
             hypothesis=None,
             final_answer=None,

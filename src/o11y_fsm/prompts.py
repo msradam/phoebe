@@ -7,11 +7,41 @@ toward the next sensible move, not heavyweight phase scripts.
 
 from __future__ import annotations
 
+from typing import Any
 
-def after_start(incident_description: str, scenario_time: str) -> str:
+
+def _trunc(items: list[Any], n: int) -> str:
+    shown = ", ".join(str(x) for x in items[:n])
+    return shown + (" ..." if len(items) > n else "")
+
+
+def schema_block(schema: dict[str, Any] | None) -> str:
+    if not schema:
+        return ""
+    lines: list[str] = []
+    if schema.get("metrics"):
+        lines.append(f"- Prometheus metrics: {_trunc(schema['metrics'], 20)}")
+    if schema.get("prometheus_labels"):
+        lines.append(f"- Prometheus labels: {_trunc(schema['prometheus_labels'], 15)}")
+    if schema.get("jobs"):
+        lines.append(f"- job label values: {_trunc(schema['jobs'], 15)}")
+    if schema.get("loki_labels"):
+        lines.append(f"- Loki labels: {_trunc(schema['loki_labels'], 15)}")
+    if not lines:
+        return ""
+    return (
+        "Discovered telemetry schema (query these exact names; do not invent metric "
+        "or label names):\n" + "\n".join(lines) + "\n\n"
+    )
+
+
+def after_start(
+    incident_description: str, scenario_time: str, schema: dict[str, Any] | None = None
+) -> str:
     return (
         f"Investigating: {incident_description}\n"
         f"Scenario clock: {scenario_time}\n\n"
+        f"{schema_block(schema)}"
         "Phase: TRIAGE. Start gathering evidence. Use:\n"
         "- query_metrics(promql, hypothesis=...) for Prometheus\n"
         "- query_logs(logql, hypothesis=...) for Loki\n"

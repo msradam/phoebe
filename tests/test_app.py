@@ -38,6 +38,14 @@ class _MockGrafana:
                 {"uid": "loki-1", "type": "loki", "name": "Loki"},
                 {"uid": "tempo-1", "type": "tempo", "name": "Tempo"},
             ]
+        if tool == "list_prometheus_metric_names":
+            return ["http_requests_total", "http_request_duration_seconds_bucket", "up"]
+        if tool == "list_prometheus_label_names":
+            return ["__name__", "job", "status", "instance"]
+        if tool == "list_prometheus_label_values":
+            return ["payment-service", "order-service"]
+        if tool == "list_loki_label_names":
+            return ["job", "service", "level", "service_name"]
         if tool == "query_prometheus":
             return {"data": f"series for {args.get('expr')}", "uid": args.get("datasourceUid")}
         if tool == "query_loki_logs":

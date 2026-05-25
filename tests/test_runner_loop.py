@@ -29,6 +29,14 @@ class _MockGrafana:
                 {"uid": "loki-1", "type": "loki"},
                 {"uid": "tempo-1", "type": "tempo"},
             ]
+        if tool == "list_prometheus_metric_names":
+            return ["http_requests_total", "up"]
+        if tool == "list_prometheus_label_names":
+            return ["job", "status"]
+        if tool == "list_prometheus_label_values":
+            return ["payment-service", "order-service"]
+        if tool == "list_loki_label_names":
+            return ["job", "service", "level"]
         return {"ok": True, "tool": tool}
 
 
