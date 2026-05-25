@@ -350,8 +350,8 @@ MAX_STEPS = 50
 MAX_NO_CALL_TURNS = 3
 _NUDGE = (
     "You did not call a tool. Do not answer in prose. Advance the investigation by "
-    "calling one FSM tool (query_metrics / query_logs / query_traces / advance_phase), "
-    "and once phase=='verify' with findings from >=2 backends, call conclude(...). "
+    "calling one tool: a Grafana query (Prometheus / Loki / Tempo) or advance_phase, "
+    "and once phase=='verify' with findings from >=2 distinct backends, call conclude(...). "
     "Read state.current_prompt for the valid next actions and the discovered schema."
 )
 

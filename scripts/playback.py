@@ -49,7 +49,10 @@ class _Mock:
 _WALK: list[tuple[str, dict[str, Any]]] = [
     (
         "start_investigation",
-        {"incident_description": "5xx spike across services", "scenario_time": "2026-05-25T06:50:00Z"},
+        {
+            "incident_description": "5xx spike across services",
+            "scenario_time": "2026-05-25T06:50:00Z",
+        },
     ),
     (
         "record_probe",

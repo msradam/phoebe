@@ -148,6 +148,9 @@ def _summarize(result: Any, limit: int = 1200) -> str:
         "schema",
         "window",
         "hypothesis",
+        "primary_service",
+        "root_cause",
+        "cascade_services",
         "final_answer",
         "investigation_summary",
         "current_prompt",
@@ -187,6 +190,9 @@ async def start_investigation(
         schema=schema,
         window={"start": start, "end": end},
         hypothesis=None,
+        primary_service=None,
+        root_cause=None,
+        cascade_services=[],
         final_answer=None,
         investigation_summary=None,
         current_prompt=prompts.after_start(incident_description.strip(), scenario_time, schema),
@@ -235,12 +241,17 @@ async def record_probe(
             f"probe budget exhausted ({len(existing)} probes). Do not gather more; "
             "advance_phase to verify if needed, then conclude with what you have."
         )
-    phase_probes = sum(1 for f in existing if f.get("phase") == phase)
-    if phase_probes >= _PROBE_BUDGET_PER_PHASE:
+    # Only telemetry queries count toward the per-phase budget: discovery and
+    # documentation calls (list_datasources, traceql docs) should not starve the
+    # phase's real queries.
+    phase_probes = sum(
+        1 for f in existing if f.get("phase") == phase and f.get("backend") in _TELEMETRY_BACKENDS
+    )
+    if be in _TELEMETRY_BACKENDS and phase_probes >= _PROBE_BUDGET_PER_PHASE:
         raise ValueError(
-            f"phase budget reached: {phase_probes} probes already recorded in the "
-            f"{phase} phase. Stop gathering and advance_phase or conclude with what "
-            "you have."
+            f"phase budget reached: {phase_probes} telemetry probes already recorded "
+            f"in the {phase} phase. Stop gathering and advance_phase or conclude with "
+            "what you have."
         )
     key = f"{be or tool}::{(query or '').strip()}"
     recent = state.get("recent_probe_hashes") or []
@@ -311,7 +322,16 @@ async def advance_phase(state: State[Any], to: str, rationale: str) -> State[Any
 
 @action(
     reads=["incident_description", "phase", "findings", "distinct_backends", "log"],
-    writes=["hypothesis", "final_answer", "investigation_summary", "current_prompt", "log"],
+    writes=[
+        "hypothesis",
+        "primary_service",
+        "root_cause",
+        "cascade_services",
+        "final_answer",
+        "investigation_summary",
+        "current_prompt",
+        "log",
+    ],
 )
 async def conclude(
     state: State[Any],
@@ -356,6 +376,9 @@ async def conclude(
     }
     return state.update(
         hypothesis=hypothesis,
+        primary_service=primary,
+        root_cause=hypothesis["root_cause"],
+        cascade_services=hypothesis["cascade_services"],
         final_answer=final_answer.strip(),
         investigation_summary=summary,
         current_prompt="Investigation complete. Final answer in state.final_answer.",
