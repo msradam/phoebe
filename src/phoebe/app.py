@@ -1,4 +1,4 @@
-"""o11y-fsm Burr Application: SRE incident investigation over Grafana, via Theodosia upstream.
+"""phoebe Burr Application: SRE incident investigation over Grafana, via Theodosia upstream.
 
 Single surface: the agent sees ONLY the FSM's actions. The query actions
 drive Grafana's MCP server through Theodosia (``call_upstream("grafana",
@@ -27,9 +27,9 @@ from burr.core import ApplicationBuilder, State, action
 from burr.core.action import Condition
 from theodosia import call_upstream
 
-from o11y_fsm import prompts
+from phoebe import prompts
 
-_TRACKER_PROJECT = "o11y-fsm"
+_TRACKER_PROJECT = "phoebe"
 _PHASES = ("triage", "diagnose", "verify")
 _DEFAULT_PHASE = "triage"
 _LOOP_GUARD_WINDOW = 4
@@ -489,7 +489,7 @@ def build_application(tracking: bool = True):
 
 
 def build_server(grafana_mcp_url: str | None = None):
-    """Mount o11y-fsm, driving Grafana through Theodosia upstream (single surface).
+    """Mount phoebe, driving Grafana through Theodosia upstream (single surface).
 
     Args:
         grafana_mcp_url: URL of the Grafana MCP server to drive. Defaults to
@@ -504,7 +504,7 @@ def build_server(grafana_mcp_url: str | None = None):
     return mount(
         build_application,
         mode=ServingMode.STEP,
-        name="o11y-fsm",
+        name="phoebe",
         upstream={"grafana": url},
         instructions=(
             "SRE incident-investigation FSM that drives a Grafana MCP server "

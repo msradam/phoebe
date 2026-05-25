@@ -24,7 +24,7 @@ Type "clear"
 Enter
 Show
 
-Type "theodosia watch -p o11y-fsm"
+Type "theodosia watch -p phoebe"
 Sleep 500ms
 Enter
 Sleep 13s

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from o11y_fsm.harbor.agent_runner import (
+from phoebe.harbor.agent_runner import (
     assistant_message,
     atif_steps_from_messages,
     extract_tool_calls,

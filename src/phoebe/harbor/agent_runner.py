@@ -14,9 +14,9 @@
 # agent's setup() (its apache-burr[tracking] extra pulls psutil, which has
 # no wheel for the gcc-less image). /app is on sys.path, so
 # `import theodosia` resolves to the vendored copy.
-"""o11y-fsm agent runner (single-surface via Theodosia upstream), Harbor container.
+"""phoebe agent runner (single-surface via Theodosia upstream), Harbor container.
 
-The agent sees ONLY the o11y-fsm actions. The query actions drive Grafana
+The agent sees ONLY the phoebe actions. The query actions drive Grafana
 through Theodosia's upstream mechanism: the runner binds an upstream manager
 that wraps its Grafana MCP session, so call_upstream("grafana", tool, args)
 inside an FSM action reaches Grafana. The Grafana tools are never exposed
@@ -43,7 +43,7 @@ sys.path.insert(0, "/app")
 
 from theodosia.upstream import bind_upstream  # noqa: E402
 
-from o11y_fsm import build_application  # noqa: E402
+from phoebe import build_application  # noqa: E402
 
 
 def scenario_clock_iso() -> str:
@@ -547,7 +547,7 @@ async def run_agent() -> None:
     traj = {
         "schema_version": "ATIF-v1.7",
         "session_id": str(uuid.uuid4()),
-        "agent": {"name": "o11y-fsm", "version": "0.1.0", "model_name": model},
+        "agent": {"name": "phoebe", "version": "0.1.0", "model_name": model},
         "steps": atif_steps,
         "compact_steps": steps_log,
         "final_metrics": {

@@ -1,9 +1,9 @@
-"""Harbor BaseAgent that drives o11y-fsm inside the bench container.
+"""Harbor BaseAgent that drives phoebe inside the bench container.
 
-The agent_runner.py + the o11y_fsm package source are uploaded into
+The agent_runner.py + the phoebe package source are uploaded into
 the container at /app/. The runner uses uv's PEP 723 inline-script
 dep declaration to install apache-burr + fastmcp + litellm + mcp on
-first run; theodosia source is vendored alongside o11y_fsm into /app.
+first run; theodosia source is vendored alongside phoebe into /app.
 """
 
 from __future__ import annotations
@@ -23,9 +23,9 @@ HARBOR_DIR = Path(__file__).parent
 RUNNER_SCRIPT = HARBOR_DIR / "agent_runner.py"
 SYSTEM_PROMPT = HARBOR_DIR / "system_prompt.txt"
 TASK_PROMPT = HARBOR_DIR / "task_prompt.txt"
-# We upload the entire o11y_fsm package source so the runner can `import o11y_fsm`
+# We upload the entire phoebe package source so the runner can `import phoebe`
 # (its PEP 723 deps install fastmcp, apache-burr, etc.; theodosia is vendored).
-PACKAGE_ROOT = HARBOR_DIR.parent  # .../src/o11y_fsm
+PACKAGE_ROOT = HARBOR_DIR.parent  # .../src/phoebe
 VIEWER_COMMAND_STDOUT_PATH = "/logs/agent/command-0/stdout.txt"
 
 
@@ -56,8 +56,8 @@ def _build_runner_command() -> str:
     return f"bash -lc {shlex.quote(cmd)}"
 
 
-class O11yFSMAgent(BaseAgent):
-    """Harbor agent that walks the o11y-fsm Burr application inside the
+class PhoebeAgent(BaseAgent):
+    """Harbor agent that walks the phoebe Burr application inside the
     bench container. Single surface: the caller LLM sees only the FSM
     actions. Grafana is bound as a Theodosia upstream and reached from
     inside the query actions; its tools are never exposed to the LLM.
@@ -79,20 +79,20 @@ class O11yFSMAgent(BaseAgent):
 
     @staticmethod
     def name() -> str:
-        return "o11y-fsm"
+        return "phoebe"
 
     def version(self) -> str:
         return "0.1.0"
 
     async def setup(self, environment: BaseEnvironment) -> None:
-        await environment.exec(command="mkdir -p /app/o11y_fsm/harbor")
+        await environment.exec(command="mkdir -p /app/phoebe/harbor")
         # Runner script + prompts.
         await environment.upload_file(source_path=RUNNER_SCRIPT, target_path="/app/agent_runner.py")
         await environment.upload_file(
             source_path=SYSTEM_PROMPT, target_path="/app/system_prompt.txt"
         )
         await environment.upload_file(source_path=TASK_PROMPT, target_path="/app/task_prompt.txt")
-        # Vendor both packages' source into the container. o11y_fsm is not on
+        # Vendor both packages' source into the container. phoebe is not on
         # PyPI; theodosia is, but its apache-burr[tracking] extra pulls psutil,
         # which has no prebuilt wheel for the gcc-less bench image, so we vendor
         # theodosia's source and the runner's PEP 723 deps pin apache-burr
@@ -100,7 +100,7 @@ class O11yFSMAgent(BaseAgent):
         # nested packages like theodosia/_experimental), then upload.
         import theodosia as _th
 
-        await self._upload_package(environment, PACKAGE_ROOT, "/app/o11y_fsm")
+        await self._upload_package(environment, PACKAGE_ROOT, "/app/phoebe")
         await self._upload_package(environment, Path(_th.__file__).parent, "/app/theodosia")
 
     @staticmethod
@@ -150,7 +150,7 @@ class O11yFSMAgent(BaseAgent):
             env["TEMPERATURE"] = str(self.temperature)
         env.update(self._extra_env)
 
-        self.logger.info(f"Running o11y-fsm agent runner with model={model}")
+        self.logger.info(f"Running phoebe agent runner with model={model}")
         await environment.exec(command=_build_runner_command(), env=env)
 
         # Pull artifacts back.

@@ -1,4 +1,4 @@
-"""o11y-fsm: single surface, drives Grafana through Theodosia upstream.
+"""phoebe: single surface, drives Grafana through Theodosia upstream.
 
 The query actions call call_upstream("grafana", ...); tests bind a mock
 upstream so no real Grafana is needed. Phase is a state variable; gating
@@ -15,13 +15,13 @@ from fastmcp import Client
 from theodosia import ServingMode, mount
 from theodosia.upstream import bind_upstream, reset_upstream
 
-from o11y_fsm.app import build_application
+from phoebe.app import build_application
 
 
 def build_server():
     # Mount WITHOUT upstream so the fixture's mock (bound on the ContextVar)
     # is the upstream. The real upstream wiring is covered by the live smoke.
-    return mount(build_application, mode=ServingMode.STEP, name="o11y-fsm")
+    return mount(build_application, mode=ServingMode.STEP, name="phoebe")
 
 
 _INCIDENT = "error rates jumped across services; triage primary vs cascade."

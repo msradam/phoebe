@@ -21,7 +21,7 @@ Type "clear"
 Enter
 Show
 
-Type "theodosia logs -p o11y-fsm"
+Type "theodosia logs -p phoebe"
 Sleep 700ms
 Enter
 Sleep 6s

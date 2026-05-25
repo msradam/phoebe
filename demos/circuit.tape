@@ -16,14 +16,14 @@ Type `export PS1="$ "`
 Enter
 Type "source .venv/bin/activate >/dev/null 2>&1 || true"
 Enter
-Type "theodosia render o11y_fsm.app:build_application --app-dir src >/dev/null 2>&1"
+Type "theodosia render phoebe.app:build_application --app-dir src >/dev/null 2>&1"
 Enter
 Sleep 4s
 Type "clear"
 Enter
 Show
 
-Type "theodosia render o11y_fsm.app:build_application --app-dir src"
+Type "theodosia render phoebe.app:build_application --app-dir src"
 Sleep 700ms
 Enter
 Sleep 4s

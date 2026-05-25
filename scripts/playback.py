@@ -4,7 +4,7 @@ a fixed action sequence stepped through the same step_fsm the Harbor runner
 uses, against a mock upstream, with a pause between steps for the recording.
 
     python scripts/playback.py        # writes a tracked session, paced
-    theodosia watch -p o11y-fsm       # in another pane, tails it live
+    theodosia watch -p phoebe       # in another pane, tails it live
 """
 
 from __future__ import annotations
@@ -15,8 +15,8 @@ from typing import Any
 
 from theodosia.upstream import bind_upstream, reset_upstream
 
-from o11y_fsm.app import build_application
-from o11y_fsm.harbor.agent_runner import step_fsm
+from phoebe.app import build_application
+from phoebe.harbor.agent_runner import step_fsm
 
 _STEP_PAUSE_S = 1.4
 

@@ -14,8 +14,8 @@ from typing import Any
 import pytest
 from theodosia.upstream import bind_upstream, reset_upstream
 
-from o11y_fsm.app import build_application
-from o11y_fsm.harbor import agent_runner as runner
+from phoebe.app import build_application
+from phoebe.harbor import agent_runner as runner
 
 
 class _MockGrafana:

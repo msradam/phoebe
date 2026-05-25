@@ -14,7 +14,7 @@ import asyncio
 import pytest
 from burr.core import State
 
-from o11y_fsm.app import advance_phase, conclude
+from phoebe.app import advance_phase, conclude
 
 _ACTIONS = {"advance_phase": advance_phase, "conclude": conclude}
 

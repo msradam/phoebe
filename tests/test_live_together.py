@@ -21,7 +21,7 @@ import os
 
 import pytest
 
-from o11y_fsm.harbor.agent_runner import FSM_TOOLS, extract_tool_calls
+from phoebe.harbor.agent_runner import FSM_TOOLS, extract_tool_calls
 
 pytestmark = pytest.mark.live
 

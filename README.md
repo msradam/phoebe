@@ -1,4 +1,4 @@
-# o11y-fsm
+# Phoebe
 
 An observability / SRE incident-investigation finite-state machine for LLM-driven agents. Mounts as an MCP server via [`theodosia`](https://github.com/msradam/theodosia); ships a [Harbor](https://harborframework.com/) agent for running against [Grafana's o11y-bench](https://github.com/grafana/o11y-bench).
 
@@ -18,25 +18,25 @@ The design follows the pattern proven in a sibling project (circe): the operatio
 ## What it gives the caller
 
 - **Phase enforcement at the protocol layer.** The agent cannot jump from `start_investigation` to `recommend_next_steps`. Cannot correlate before evidence from ≥2 backends. Cannot finalize before verifying.
-- **Auditable trail.** Every step is a row in Burr's tracker (`~/.theodosia/o11y-fsm/<app_id>/log.jsonl`). Replayable, forkable, diffable. Tail it with `theodosia watch --project o11y-fsm`.
+- **Auditable trail.** Every step is a row in Burr's tracker (`~/.theodosia/phoebe/<app_id>/log.jsonl`). Replayable, forkable, diffable. Tail it with `theodosia watch --project phoebe`.
 - **Backend-agnostic.** The FSM doesn't know about Prometheus or Loki. The caller LLM runs the actual queries (against whatever MCP tools its environment exposes) and reports findings back via the next FSM step.
 
 ## Install
 
 ```bash
-pip install o11y-fsm
+pip install phoebe
 ```
 
 For running as a Harbor agent against o11y-bench:
 
 ```bash
-pip install 'o11y-fsm[harbor]'
+pip install 'phoebe[harbor]'
 ```
 
 ## Use standalone
 
 ```python
-from o11y_fsm import build_server
+from phoebe import build_server
 
 server = build_server()
 server.run()  # serves over stdio MCP
@@ -45,12 +45,12 @@ server.run()  # serves over stdio MCP
 Or via the theodosia CLI:
 
 ```bash
-theodosia serve o11y_fsm.app:build_application --name o11y-fsm
+theodosia serve phoebe.app:build_application --name phoebe
 ```
 
 ## Use on o11y-bench
 
-`o11y_fsm.harbor:O11yFSMAgent` is a [Harbor `BaseAgent`](https://www.harborframework.com/docs/agents) that wraps the FSM. It:
+`phoebe.harbor:PhoebeAgent` is a [Harbor `BaseAgent`](https://www.harborframework.com/docs/agents) that wraps the FSM. It:
 
 1. Walks the FSM via MCP
 2. Routes the caller LLM's tool calls to Grafana's MCP server (`mcp-grafana`, exposed in Harbor's o11y-stack sidecar)
@@ -60,7 +60,7 @@ To use it in an o11y-bench job:
 
 ```bash
 mise run bench:job -- \
-  --agent-import-path o11y_fsm.harbor:O11yFSMAgent \
+  --agent-import-path phoebe.harbor:PhoebeAgent \
   --model openai/meta-llama/Llama-3.3-70B-Instruct-Turbo \
   --task-name incident-triage \
   --n-attempts 3
@@ -87,7 +87,7 @@ The accompanying lesson on gate calibration: enforce the invariant that matters 
 ## Repo layout
 
 ```
-src/o11y_fsm/
+src/phoebe/
   app.py             FSM actions + graph + build_application + build_server
   prompts.py         Per-phase prompt templates
   harbor/            Harbor agent wrapper (optional dep)
@@ -100,4 +100,4 @@ Apache 2.0.
 
 ## Notice
 
-`o11y-fsm` is independent open-source work by Adam Munawar Rahman and does not represent the views, positions, or technology roadmap of IBM Corporation or any other employer. It is built on [Apache Burr](https://github.com/apache/burr) and [theodosia](https://github.com/msradam/theodosia); references to Grafana's [o11y-bench](https://github.com/grafana/o11y-bench) are for integration purposes and do not imply endorsement.
+`phoebe` is independent open-source work by Adam Munawar Rahman and does not represent the views, positions, or technology roadmap of IBM Corporation or any other employer. It is built on [Apache Burr](https://github.com/apache/burr) and [theodosia](https://github.com/msradam/theodosia); references to Grafana's [o11y-bench](https://github.com/grafana/o11y-bench) are for integration purposes and do not imply endorsement.

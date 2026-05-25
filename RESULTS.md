@@ -1,11 +1,11 @@
 # Results: o11y-bench investigation set (first run)
 
-Date: 2026-05-25. A first, unoptimized run of the `o11y-fsm` investigation
+Date: 2026-05-25. A first, unoptimized run of the `phoebe` investigation
 harness on Grafana's o11y-bench, with a real grading pass.
 
 ## Setup
 
-- Harness: `o11y-fsm`, an SRE incident-investigation finite state machine,
+- Harness: `phoebe`, an SRE incident-investigation finite state machine,
   mounted as an MCP server by [Theodosia](https://github.com/msradam/theodosia) (v0.1).
 - Driver model: Kimi K2.6 (1T MoE, open weights) via Together, function
   calling. The model never sees Grafana directly. It drives the FSM; the FSM
@@ -153,7 +153,7 @@ docker run -d -p 3000:3000 -p 9090:9090 -p 3100:3100 -p 3200:3200 -p 8080:8080 \
 
 # one task through the FSM, graded
 mise run bench:job -- \
-  --agent-import-path o11y_fsm.harbor:O11yFSMAgent \
+  --agent-import-path phoebe.harbor:PhoebeAgent \
   --model openai/moonshotai/Kimi-K2.6 \
   --task-name incident-triage --n-attempts 1
 ```
