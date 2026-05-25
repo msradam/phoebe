@@ -2,24 +2,30 @@
 
 An observability / SRE incident-investigation finite-state machine for LLM-driven agents. Mounts as an MCP server via [`theodosia`](https://github.com/msradam/theodosia); ships a [Harbor](https://harborframework.com/) agent for running against [Grafana's o11y-bench](https://github.com/grafana/o11y-bench).
 
+The agent keeps the full Grafana toolset. Phoebe gates the procedure, not the tools: which phase you are in, whether you have cross-referenced enough backends, and whether you may conclude.
+
 ```text
-start_investigation
-  ├─ query_metrics(promql)   ┐  the query actions ARE the operations:
-  ├─ query_logs(logql)       │  each runs the query through a bound
-  ├─ query_traces(traceql)   ┘  telemetry client and records evidence
-  ├─ advance_phase(to, rationale)   triage → diagnose → verify
-  └─ conclude(primary_service, root_cause, final_answer, cascade_services)
+start_investigation            open the case; discover datasources + schema
+  │
+  ├─ <full Grafana toolset>    query Prometheus / Loki / Tempo, list dashboards, ...
+  │                            every call is recorded as evidence (record_probe)
+  ├─ advance_phase(to, ...)    triage → diagnose → verify
+  └─ conclude(...)             gated terminal
 ```
 
-Hub topology: every operational action is reachable from every other. The methodology is enforced inside action bodies, not by narrowing the graph (this is what makes a mid-size model able to *drive* the FSM instead of fighting it). `conclude` is gated: phase must be `verify`, you need probes from ≥2 distinct backends, and at least one probe must have run during the verify phase. A repeated identical probe is refused ("vary the probe").
+Hub topology: every action is reachable from every other. The methodology is enforced inside action bodies, not by narrowing the graph or the toolset (this is what lets a mid-size model *drive* the FSM instead of fighting it). `conclude` is gated: phase must be `verify`, you need evidence from ≥2 distinct telemetry backends, and at least one probe must have run during the verify phase. Each phase has a query budget, so once it is spent the only moves are `advance_phase` or `conclude`. A repeated identical probe is refused ("vary the probe").
 
-The design follows the pattern proven in a sibling project (circe): the operation is the FSM action. There is no separate "do work here, record it there" surface; calling `query_metrics` runs the query and advances state in one step. State and audit trail live on the server.
+Two models, same FSM, same incident, both sound through the harness:
+
+![Kimi K2.6 driven through the investigation by Theodosia](demos/hero.gif)
+
+![Claude Sonnet 4.6 driven through the same investigation](demos/hero_sonnet.gif)
 
 ## What it gives the caller
 
-- **Phase enforcement at the protocol layer.** The agent cannot jump from `start_investigation` to `recommend_next_steps`. Cannot correlate before evidence from ≥2 backends. Cannot finalize before verifying.
-- **Auditable trail.** Every step is a row in Burr's tracker (`~/.theodosia/phoebe/<app_id>/log.jsonl`). Replayable, forkable, diffable. Tail it with `theodosia watch --project phoebe`.
-- **Backend-agnostic.** The FSM doesn't know about Prometheus or Loki. The caller LLM runs the actual queries (against whatever MCP tools its environment exposes) and reports findings back via the next FSM step.
+- **Phase enforcement at the protocol layer.** The agent cannot conclude before reaching `verify`, cannot reach `verify` without evidence from ≥2 distinct backends, and cannot gather past a phase's query budget. The gates live in the action bodies; the toolset stays open.
+- **Auditable trail.** Every tool call is recorded as evidence and every step is a row in Burr's tracker (`~/.theodosia/phoebe/<app_id>/log.jsonl`). Replayable, forkable, diffable. Tail it with `theodosia watch --project phoebe`.
+- **Backend-agnostic.** The FSM doesn't hard-code Prometheus or Loki. The agent calls whatever Grafana tools its environment exposes; `record_probe` logs each call and tags its backend so the cross-reference gate stays honest.
 
 ## Install
 
@@ -76,11 +82,13 @@ The o11y-bench rubrics for the `investigation` task category grade on phase disc
 
 These are exactly the criteria an FSM gate can enforce mechanically. SKILL.md prose describes the methodology; this FSM is the methodology, refusing illegal transitions. A weak model that would otherwise skip phases under pressure has no legal step to take except the next phase.
 
-## Design note: why single-surface
+## Design note: gate the procedure, not the tools
 
-The first cut (v0.1) split the work across two tool surfaces: the agent used the harness's raw Grafana MCP tools to query, then *separately* called the FSM to record what it found. A mid-size model (Llama 3.3 70B) got absorbed in the query surface and never crossed to the bookkeeping surface, looping `query_prometheus` dozens of times without ever advancing the FSM.
+The design went through three cuts, and the lesson is the boundary the FSM should enforce.
 
-The fix (v0.2) collapses to one surface: the query actions ARE the operations. The only way to touch telemetry is through `query_metrics` / `query_logs` / `query_traces`, each of which runs the query and records evidence in a single step. There is no second surface to get stuck on. This mirrors the design of a sibling Burr agent (circe), where the same model drives a comparable FSM reliably.
+- **v0.1, two surfaces.** The agent used the raw Grafana tools to query, then *separately* called the FSM to record what it found. A mid-size model (Llama 3.3 70B) got absorbed in the query surface and never crossed to the bookkeeping surface, looping `query_prometheus` without ever advancing the FSM.
+- **v0.2, one narrow surface.** Collapse to three query actions (`query_metrics` / `query_logs` / `query_traces`) that each run the query and record evidence in one step. This drove reliably, but it amputated capability: an ablation showed it roughly matching a raw-tools agent, because the agent could no longer reach traces it needed, list dashboards, or shape a query the way the task wanted.
+- **v0.3, open toolset, gated procedure.** Keep the full Grafana toolset. Record every call as evidence through `record_probe`, and enforce the invariant in the action bodies: phases advance in order, `conclude` is gated behind cross-referenced evidence, and each phase has a query budget so the action space narrows to `advance_phase` / `conclude` once gathering is done. The FSM gates *when* and *whether*, never *which tool*.
 
 The accompanying lesson on gate calibration: enforce the invariant that matters (don't conclude before cross-referencing ≥2 backends, don't conclude without a verifying probe) via action-body checks, and keep graph reachability broad so the agent is never told "no" by the graph for a normal operation. A repeated identical probe is refused with a specific reason ("vary the probe"), not a dead end.
 

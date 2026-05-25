@@ -22,7 +22,19 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
-_TRACE = Path(__file__).parent / "hero_trace.json"
+_args = [a for a in sys.argv[1:] if not a.startswith("--")]
+_TRACE = Path(_args[0]) if _args else Path(__file__).parent / "hero_trace.json"
+
+
+def _model_display(model: str) -> str:
+    m = model.lower()
+    if "kimi" in m:
+        return "Kimi K2.6"
+    if "sonnet" in m:
+        return "Claude Sonnet 4.6"
+    if "gpt" in m or "openai/o" in m:
+        return model.split("/")[-1]
+    return model.split("/")[-1]
 
 # Rose Pine
 BASE = "#191724"
@@ -97,7 +109,7 @@ def main() -> None:
                 ("incident   ", f"bold {MUTED}"),
                 (trace["incident"], TEXT),
                 ("\nagent      ", f"bold {MUTED}"),
-                ("Kimi K2.6", f"bold {ROSE}"),
+                (_model_display(trace.get("model", "")), f"bold {ROSE}"),
                 ("  driven on rails by ", MUTED),
                 ("Theodosia", f"bold {IRIS}"),
                 ("  (open Grafana toolset, gated phases)", MUTED),

@@ -34,7 +34,7 @@ _INCIDENT = (
     "Error rates and latency climbed across several services in the last hour. "
     "Find the primary service at fault, the root cause, and the blast radius."
 )
-_OUT = Path(__file__).parent / "hero_trace.json"
+_OUT = Path(os.environ.get("CAPTURE_OUT", Path(__file__).parent / "hero_trace.json"))
 
 
 def _short(obj: Any, n: int = 220) -> str:
