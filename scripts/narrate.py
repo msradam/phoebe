@@ -12,11 +12,14 @@ asked, the server said no.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import textwrap
 import time
 from pathlib import Path
 from typing import Any
+
+HERO = os.environ.get("THD_HERO") == "1"  # compact portrait layout for the hero gif
 
 from rich.console import Console
 from rich.panel import Panel
@@ -51,7 +54,7 @@ IRIS = "#c4a7e7"
 PHASE_COLOR = {"triage": FOAM, "diagnose": IRIS, "verify": GOLD, "conclude": PINE}
 SKIP = {"list_datasources"}  # pure discovery; not part of the story
 
-console = Console(width=100)
+console = Console(width=58 if HERO else 100)
 FAST = "--fast" in sys.argv
 
 
@@ -105,23 +108,38 @@ def main() -> None:
     steps: list[dict[str, Any]] = trace["steps"]
 
     console.print()
-    console.print(
-        Panel(
-            Text.assemble(
-                ("incident   ", f"bold {MUTED}"),
-                (trace["incident"], TEXT),
-                ("\nagent      ", f"bold {MUTED}"),
-                (_model_display(trace.get("model", "")), f"bold {ROSE}"),
-                ("  driven on rails by ", MUTED),
-                ("Theodosia", f"bold {IRIS}"),
-                ("  (open Grafana toolset, gated phases)", MUTED),
-            ),
-            border_style=IRIS,
-            title="[bold]Phoebe[/]  ·  live SRE investigation",
-            title_align="left",
-            padding=(0, 1),
+    if HERO:
+        console.print(
+            Panel(
+                Text.assemble(
+                    (_model_display(trace.get("model", "")), f"bold {ROSE}"),
+                    ("\non rails by ", MUTED),
+                    ("Theodosia", f"bold {IRIS}"),
+                ),
+                border_style=IRIS,
+                title="[bold]Phoebe[/]  ·  SRE investigation",
+                title_align="left",
+                padding=(0, 1),
+            )
         )
-    )
+    else:
+        console.print(
+            Panel(
+                Text.assemble(
+                    ("incident   ", f"bold {MUTED}"),
+                    (trace["incident"], TEXT),
+                    ("\nagent      ", f"bold {MUTED}"),
+                    (_model_display(trace.get("model", "")), f"bold {ROSE}"),
+                    ("  driven on rails by ", MUTED),
+                    ("Theodosia", f"bold {IRIS}"),
+                    ("  (open Grafana toolset, gated phases)", MUTED),
+                ),
+                border_style=IRIS,
+                title="[bold]Phoebe[/]  ·  live SRE investigation",
+                title_align="left",
+                padding=(0, 1),
+            )
+        )
     console.print()
     pause(2.2)
 
@@ -136,8 +154,8 @@ def main() -> None:
             phase = st.get("args", {}).get("to", phase)
             why = st.get("args", {}).get("rationale", "")
             c = PHASE_COLOR.get(phase, MUTED)
-            console.print(Text(f"   ────────►  advance to {phase.upper()}", style=f"bold {c}"))
-            if why:
+            console.print(Text(f"   ──►  advance to {phase.upper()}", style=f"bold {c}"))
+            if why and not HERO:
                 wrapped = _wrap(why, 92, "             ").splitlines()[:3]
                 if wrapped:
                     wrapped[-1] = wrapped[-1].rstrip(".") + " …"
@@ -151,6 +169,17 @@ def main() -> None:
         mark_c = LOVE if refused else PHASE_COLOR.get(phase, FOAM)
         q = _query(st.get("args", {}))
         result = st.get("result", "")
+        if HERO:
+            # Compact portrait row: phase rail + tool, no query/signal tail.
+            console.print(
+                Text.assemble(
+                    _tag(phase),
+                    (f"  {mark} ", f"bold {mark_c}"),
+                    (f"{tool[:20]}", f"bold {TEXT}"),
+                )
+            )
+            pause(1.1)
+            continue
         if refused:
             note = result.split(":", 1)[0].split("(")[0].strip()
             tail = Text.assemble(("  refused · ", f"bold {LOVE}"), (note[:24], LOVE))
@@ -170,20 +199,34 @@ def main() -> None:
     pause(1.2)
     primary = trace.get("primary_service") or "?"
     root = " ".join((trace.get("root_cause") or "").split())
-    console.print(
-        Panel(
-            Text.assemble(
-                ("primary at fault   ", f"bold {MUTED}"),
-                (primary, f"bold {GOLD}"),
-                ("\nroot cause         ", f"bold {MUTED}"),
-                (root[:150] + ("…" if len(root) > 150 else ""), TEXT),
-            ),
-            border_style=PINE,
-            title="[bold]conclude[/]  ✓  gate: verify · 2+ backends · verify-phase probe",
-            title_align="left",
-            padding=(0, 1),
+    if HERO:
+        console.print(
+            Panel(
+                Text.assemble(
+                    ("primary at fault  ", f"bold {MUTED}"),
+                    (primary, f"bold {GOLD}"),
+                ),
+                border_style=PINE,
+                title="[bold]conclude[/]  ✓ gated",
+                title_align="left",
+                padding=(0, 1),
+            )
         )
-    )
+    else:
+        console.print(
+            Panel(
+                Text.assemble(
+                    ("primary at fault   ", f"bold {MUTED}"),
+                    (primary, f"bold {GOLD}"),
+                    ("\nroot cause         ", f"bold {MUTED}"),
+                    (root[:150] + ("…" if len(root) > 150 else ""), TEXT),
+                ),
+                border_style=PINE,
+                title="[bold]conclude[/]  ✓  gate: verify · 2+ backends · verify-phase probe",
+                title_align="left",
+                padding=(0, 1),
+            )
+        )
     console.print()
     pause(3.0)  # let the conclusion rest on screen at the end of the recording
 
