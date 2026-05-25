@@ -36,6 +36,7 @@ def _model_display(model: str) -> str:
         return model.split("/")[-1]
     return model.split("/")[-1]
 
+
 # Rose Pine
 BASE = "#191724"
 TEXT = "#e0def4"

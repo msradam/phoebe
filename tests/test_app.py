@@ -203,6 +203,45 @@ async def test_happy_path():
 
 
 @pytest.mark.asyncio
+async def test_verify_probe_allowed_after_total_budget_exhausted(monkeypatch):
+    # Latent deadlock guard: if the total budget is spent before verify, the one
+    # mandatory verify-phase confirming probe (which conclude requires) must
+    # still be permitted, or conclude can never fire. Force the condition with a
+    # small budget so triage+diagnose alone exhaust it.
+    from phoebe import app
+
+    monkeypatch.setattr(app, "_PROBE_BUDGET_PER_PHASE", 3)
+    monkeypatch.setattr(app, "_PROBE_BUDGET_TOTAL", 4)
+    async with Client(build_server()) as client:
+        await _start(client)
+        await _probe(client, "query_prometheus", "prometheus", "q1")
+        await _probe(client, "query_loki_logs", "loki", "q2")
+        await _probe(client, "query_prometheus", "prometheus", "q3")
+        await _step(client, "advance_phase", to="diagnose", rationale="primary found")
+        await _probe(client, "query_loki_logs", "loki", "q4")  # total telemetry now 4 == budget
+        await _step(client, "advance_phase", to="verify", rationale="confirm")
+        # budget is spent, but the mandatory confirming probe is still allowed:
+        out = _p(await _probe(client, "tempo_traceql-search", "tempo", "verify-probe"))
+        assert "error" not in out
+        # a SECOND verify probe is refused (the exemption covers only the first):
+        blocked = _p(await _probe(client, "query_prometheus", "prometheus", "extra"))
+        assert blocked["error"] == "action_error"
+        assert "budget" in blocked["error_message"]
+        done = _p(
+            await _step(
+                client,
+                "conclude",
+                primary_service="payment-service",
+                root_cause="pool exhaustion",
+                final_answer=(
+                    "# Triage\n\n" + "Primary payment-service; order-service cascade. " * 2
+                ),
+            )
+        )
+        assert "error" not in done
+
+
+@pytest.mark.asyncio
 async def test_history_records_steps():
     async with Client(build_server()) as client:
         await _start(client)

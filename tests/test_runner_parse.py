@@ -13,8 +13,29 @@ from types import SimpleNamespace
 from phoebe.harbor.agent_runner import (
     assistant_message,
     atif_steps_from_messages,
+    backend_for,
     extract_tool_calls,
 )
+
+
+def test_backend_for_classifies_queries_not_discovery():
+    # Real queries map to their backend (these satisfy the cross-reference gate).
+    assert backend_for("query_prometheus") == "prometheus"
+    assert backend_for("query_loki_logs") == "loki"
+    assert backend_for("tempo_traceql-search") == "tempo"
+    assert backend_for("tempo_get-trace") == "tempo"
+    assert backend_for("tempo_traceql-metrics-instant") == "tempo"
+    # Discovery / metadata / docs name a backend but are NOT evidence from it:
+    # classifying them would let two label-listings satisfy the >=2-backend gate
+    # with zero real queries, and would burn the phase query budget.
+    assert backend_for("list_prometheus_label_names") is None
+    assert backend_for("list_loki_label_names") is None
+    assert backend_for("list_prometheus_metric_names") is None
+    assert backend_for("list_datasources") is None
+    assert backend_for("tempo_docs-traceql") is None
+    # Non-telemetry tools map to None.
+    assert backend_for("list_alert_rules") is None
+    assert backend_for("create_annotation") is None
 
 
 def _structured(name: str, arguments: str, call_id: str = "c0"):

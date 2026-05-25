@@ -356,15 +356,36 @@ _NUDGE = (
 )
 
 
+# Schema / discovery / documentation calls name a backend but are not evidence
+# from it. Classifying them as a telemetry backend would let two label-listing
+# calls satisfy the >=2-backend cross-reference gate with zero real queries, and
+# would burn the phase query budget on discovery. They map to None.
+_DISCOVERY_MARKERS = (
+    "list_",
+    "label_names",
+    "label_values",
+    "metric_names",
+    "metric_metadata",
+    "metadata",
+    "datasource",
+    "_docs",
+    "docs-",
+    "list-",
+)
+
+
 def backend_for(tool: str) -> str | None:
-    """Map a Grafana tool name to a telemetry backend for the cross-reference
-    gate. Non-telemetry tools (dashboards, annotations, alerting) return None."""
+    """Map a Grafana tool name to the telemetry backend it produced evidence
+    from, for the cross-reference gate. Discovery/metadata/documentation calls
+    and non-telemetry tools (dashboards, annotations, alerting) return None."""
     t = (tool or "").lower()
-    if "prometheus" in t:
+    if any(k in t for k in _DISCOVERY_MARKERS):
+        return None
+    if "prometheus" in t or "promql" in t:
         return "prometheus"
-    if "loki" in t:
+    if "loki" in t or "logql" in t:
         return "loki"
-    if "tempo" in t or "trace" in t:
+    if "tempo" in t or "trace" in t or "traceql" in t:
         return "tempo"
     return None
 

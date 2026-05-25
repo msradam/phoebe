@@ -236,23 +236,30 @@ async def record_probe(
         be = None
     phase = state.get("phase") or _DEFAULT_PHASE
     existing = state.get("findings") or []
-    if len(existing) >= _PROBE_BUDGET_TOTAL:
-        raise ValueError(
-            f"probe budget exhausted ({len(existing)} probes). Do not gather more; "
-            "advance_phase to verify if needed, then conclude with what you have."
-        )
-    # Only telemetry queries count toward the per-phase budget: discovery and
-    # documentation calls (list_datasources, traceql docs) should not starve the
-    # phase's real queries.
-    phase_probes = sum(
-        1 for f in existing if f.get("phase") == phase and f.get("backend") in _TELEMETRY_BACKENDS
-    )
-    if be in _TELEMETRY_BACKENDS and phase_probes >= _PROBE_BUDGET_PER_PHASE:
-        raise ValueError(
-            f"phase budget reached: {phase_probes} telemetry probes already recorded "
-            f"in the {phase} phase. Stop gathering and advance_phase or conclude with "
-            "what you have."
-        )
+    # Budgets count only telemetry queries: discovery / documentation calls
+    # (list_datasources, label listings, traceql docs) carry backend=None and
+    # must not starve a phase of its real queries.
+    telemetry = [f for f in existing if f.get("backend") in _TELEMETRY_BACKENDS]
+    is_telemetry = be in _TELEMETRY_BACKENDS
+    verify_probe_exists = any(f.get("phase") == "verify" for f in telemetry)
+    # conclude requires a telemetry probe recorded during verify; always permit
+    # that one mandatory confirming probe, even past budget, so a thorough
+    # investigation that spent its budget earlier cannot deadlock at conclude.
+    mandatory_verify = phase == "verify" and is_telemetry and not verify_probe_exists
+    if is_telemetry and not mandatory_verify:
+        if len(telemetry) >= _PROBE_BUDGET_TOTAL:
+            raise ValueError(
+                f"probe budget exhausted ({len(telemetry)} telemetry probes). Do not "
+                "gather more; advance_phase to verify if needed, then conclude. One "
+                "confirming probe is still allowed during the verify phase."
+            )
+        phase_probes = sum(1 for f in telemetry if f.get("phase") == phase)
+        if phase_probes >= _PROBE_BUDGET_PER_PHASE:
+            raise ValueError(
+                f"phase budget reached: {phase_probes} telemetry probes already recorded "
+                f"in the {phase} phase. Stop gathering and advance_phase or conclude with "
+                "what you have."
+            )
     key = f"{be or tool}::{(query or '').strip()}"
     recent = state.get("recent_probe_hashes") or []
     if key in recent[-_LOOP_GUARD_WINDOW:]:
