@@ -1,8 +1,7 @@
-"""phoebe: single surface, drives Grafana through Theodosia upstream.
-
-The query actions call call_upstream("grafana", ...); tests bind a mock
-upstream so no real Grafana is needed. Phase is a state variable; gating
-lives in action bodies; hub topology.
+"""phoebe FSM: open toolset, phase-gated. The agent has the full Grafana
+toolset; the FSM enforces phases and termination and records each call via
+record_probe. Tests bind a mock upstream (for start's discovery) and exercise
+the FSM actions directly through the mounted MCP server.
 """
 
 from __future__ import annotations
@@ -19,8 +18,6 @@ from phoebe.app import build_application
 
 
 def build_server():
-    # Mount WITHOUT upstream so the fixture's mock (bound on the ContextVar)
-    # is the upstream. The real upstream wiring is covered by the live smoke.
     return mount(build_application, mode=ServingMode.STEP, name="phoebe")
 
 
@@ -28,7 +25,7 @@ _INCIDENT = "error rates jumped across services; triage primary vs cascade."
 
 
 class _MockGrafana:
-    """Stands in for the Grafana MCP server bound as upstream."""
+    """Stands in for the Grafana MCP server bound as upstream (start's discovery)."""
 
     async def call(self, server: str, tool: str, args: dict[str, Any]) -> Any:
         assert server == "grafana"
@@ -39,19 +36,13 @@ class _MockGrafana:
                 {"uid": "tempo-1", "type": "tempo", "name": "Tempo"},
             ]
         if tool == "list_prometheus_metric_names":
-            return ["http_requests_total", "http_request_duration_seconds_bucket", "up"]
+            return ["http_requests_total", "up"]
         if tool == "list_prometheus_label_names":
-            return ["__name__", "job", "status", "instance"]
+            return ["job", "status"]
         if tool == "list_prometheus_label_values":
             return ["payment-service", "order-service"]
         if tool == "list_loki_label_names":
-            return ["job", "service", "level", "service_name"]
-        if tool == "query_prometheus":
-            return {"data": f"series for {args.get('expr')}", "uid": args.get("datasourceUid")}
-        if tool == "query_loki_logs":
-            return {"streams": f"logs for {args.get('logql')}", "uid": args.get("datasourceUid")}
-        if tool == "tempo_traceql-search":
-            return {"traces": f"traces for {args.get('query')}"}
+            return ["job", "service", "level"]
         return {"_unhandled": tool}
 
 
@@ -81,9 +72,20 @@ async def _start(client):
     )
 
 
+async def _probe(client, tool, backend, query, result_summary="result"):
+    return await _step(
+        client,
+        "record_probe",
+        tool=tool,
+        backend=backend,
+        query=query,
+        result_summary=result_summary,
+    )
+
+
 async def _two_backends(client):
-    await _step(client, "query_metrics", promql="sum(rate(http_5xx[5m]))")
-    await _step(client, "query_logs", logql='{job="payment"} |= "error"')
+    await _probe(client, "query_prometheus", "prometheus", "sum(rate(http_requests_total[5m]))")
+    await _probe(client, "query_loki_logs", "loki", '{service_name="payment-service"} |= "error"')
 
 
 @pytest.mark.asyncio
@@ -111,31 +113,43 @@ async def test_start_rejects_empty_incident():
 
 
 @pytest.mark.asyncio
-async def test_query_metrics_drives_grafana_with_uid():
+async def test_record_probe_records_evidence():
     async with Client(build_server()) as client:
         await _start(client)
-        out = _p(await _step(client, "query_metrics", promql="up"))
+        out = _p(await _probe(client, "query_prometheus", "prometheus", "up", "1 series"))
         assert "error" not in out
         f = out["state"]["findings"][-1]
         assert f["backend"] == "prometheus"
-        assert "prom-1" in f["result_summary"]  # uid threaded into the query
+        assert f["tool"] == "query_prometheus"
 
 
 @pytest.mark.asyncio
 async def test_loop_guard():
     async with Client(build_server()) as client:
         await _start(client)
-        await _step(client, "query_metrics", promql="up")
-        out = _p(await _step(client, "query_metrics", promql="up"))
+        await _probe(client, "query_prometheus", "prometheus", "up")
+        out = _p(await _probe(client, "query_prometheus", "prometheus", "up"))
         assert out["error"] == "action_error"
         assert "loop guard" in out["error_message"]
+
+
+@pytest.mark.asyncio
+async def test_non_telemetry_tool_does_not_count_as_backend():
+    async with Client(build_server()) as client:
+        await _start(client)
+        await _probe(client, "query_prometheus", "prometheus", "up")
+        # a dashboard call records but must not satisfy the >=2-backend gate
+        await _probe(client, "get_dashboard_by_uid", None, "dash-1")
+        out = _p(await _step(client, "advance_phase", to="verify", rationale="x"))
+        assert out["error"] == "action_error"
+        assert "distinct backends" in out["error_message"]
 
 
 @pytest.mark.asyncio
 async def test_advance_verify_requires_two_backends():
     async with Client(build_server()) as client:
         await _start(client)
-        await _step(client, "query_metrics", promql="up")
+        await _probe(client, "query_prometheus", "prometheus", "up")
         out = _p(await _step(client, "advance_phase", to="verify", rationale="x"))
         assert out["error"] == "action_error"
         assert "distinct backends" in out["error_message"]
@@ -167,7 +181,7 @@ async def test_happy_path():
         await _two_backends(client)
         await _step(client, "advance_phase", to="diagnose", rationale="payment primary")
         await _step(client, "advance_phase", to="verify", rationale="confirm")
-        await _step(client, "query_metrics", promql="pool_in_use{service='payment'}")
+        await _probe(client, "query_prometheus", "prometheus", "pool_in_use{service='payment'}")
         out = _p(
             await _step(
                 client,
@@ -196,6 +210,6 @@ async def test_history_records_steps():
         history = json.loads((await client.read_resource("theodosia://history"))[0].text)
         assert [h["action"] for h in history] == [
             "start_investigation",
-            "query_metrics",
-            "query_logs",
+            "record_probe",
+            "record_probe",
         ]

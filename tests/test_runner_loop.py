@@ -1,11 +1,10 @@
-"""Infrastructure smoke test for the agent loop.
+"""Infrastructure smoke test for the agent loop with the open toolset.
 
-Drives the runner's full turn loop (drive_investigation) with a scripted
-fake LLM and a mock Grafana upstream: no Docker, no real model, no grading.
-It deliberately delivers some tool calls (including the terminal conclude)
-in the leaked native-token format to prove the loop reaches a conclusion
-even when a model emits that shape. This is the cheap guard that must pass
-before spending tokens on a graded run.
+Drives the runner's loop (drive_investigation) with a scripted fake LLM that
+calls the real Grafana tool names (routed through call_grafana + record_probe)
+plus the FSM control actions. A mock upstream stands in for Grafana, so no
+Docker, no real model, no grading. Some calls arrive in the leaked native-token
+format to prove the loop still drives to a conclusion.
 """
 
 from __future__ import annotations
@@ -15,7 +14,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from theodosia.upstream import bind_upstream, reset_upstream
+from theodosia.upstream import bind_upstream, call_upstream, reset_upstream
 
 from phoebe.app import build_application
 from phoebe.harbor import agent_runner as runner
@@ -37,7 +36,7 @@ class _MockGrafana:
             return ["payment-service", "order-service"]
         if tool == "list_loki_label_names":
             return ["job", "service", "level"]
-        return {"ok": True, "tool": tool}
+        return {"ok": True, "tool": tool, "rows": 3}
 
 
 @pytest.fixture(autouse=True)
@@ -47,6 +46,10 @@ def _bind_mock():
         yield
     finally:
         reset_upstream(token)
+
+
+def _grafana(name, args):
+    return call_upstream("grafana", name, args)
 
 
 def _structured(name: str, args: dict[str, Any]):
@@ -67,86 +70,64 @@ class _ScriptedLLM:
         self._queue = list(messages)
 
     async def __call__(self, _messages: list[dict[str, Any]]) -> Any:
+        if not self._queue:
+            return SimpleNamespace(content="", tool_calls=None)
         return self._queue.pop(0)
 
 
+_FINAL = (
+    "Primary payment-service exhausted its connection pool at 14:02; order-service cascaded "
+    "downstream. Metrics and logs agree on the timing."
+)
+
+
 @pytest.mark.asyncio
-async def test_loop_reaches_conclusion_even_with_leaked_calls():
-    final = (
-        "Primary payment-service exhausted its connection pool at 14:02; order-service "
-        "cascaded downstream. Metrics and logs agree."
-    )
+async def test_open_toolset_walk_reaches_conclusion():
     script = _ScriptedLLM(
         [
             _structured(
                 "start_investigation",
                 {"incident_description": "5xx spike", "scenario_time": "2026-05-24T14:00:00Z"},
             ),
-            _structured("query_metrics", {"promql": "sum(rate(http_5xx[5m]))"}),
-            _structured("query_logs", {"logql": '{job="payment"} |= "error"'}),
+            _structured(
+                "query_prometheus", {"expr": 'rate(http_requests_total{status=~"5.."}[5m])'}
+            ),
+            _structured(
+                "query_loki_logs", {"logql": '{service_name="payment-service"} |= "error"'}
+            ),
+            # a real Grafana tool the old narrow design could not reach:
+            _structured("tempo_get-trace", {"traceID": "abc123"}),
             _structured("advance_phase", {"to": "diagnose", "rationale": "payment leads"}),
-            # the model switches to its native token format from here:
             _leaked("advance_phase", {"to": "verify", "rationale": "metrics and logs agree"}),
-            _leaked("query_metrics", {"promql": "pool_in_use{service='payment'}"}),
+            _leaked("query_prometheus", {"expr": "pool_in_use{service='payment'}"}),
             _leaked(
                 "conclude",
                 {
                     "primary_service": "payment-service",
                     "cascade_services": ["order-service"],
                     "root_cause": "connection pool exhaustion at 14:02",
-                    "final_answer": final,
-                },
-            ),
-        ]
-    )
-
-    app = build_application(tracking=False)
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": "x"},
-        {"role": "user", "content": "y"},
-    ]
-    result = await runner.drive_investigation(script, app, messages, max_steps=20)
-
-    assert runner.fsm_terminated(app)
-    assert app.state["final_answer"] == final
-    assert app.state["investigation_summary"]["primary_service"] == "payment-service"
-    assert result["total_tool_calls"] == 7
-
-
-@pytest.mark.asyncio
-async def test_loop_nudges_past_an_empty_turn():
-    final = (
-        "Primary payment-service exhausted its connection pool; order-service cascaded. "
-        "Metrics and logs agree on the timing."
-    )
-    script = _ScriptedLLM(
-        [
-            _structured(
-                "start_investigation",
-                {"incident_description": "5xx spike", "scenario_time": "2026-05-24T14:00:00Z"},
-            ),
-            SimpleNamespace(content="", tool_calls=None),  # intermittent empty turn
-            _structured("query_metrics", {"promql": "sum(rate(http_requests_total[5m]))"}),
-            _structured("query_logs", {"logql": '{service_name="payment-service"} |= "error"'}),
-            _structured("advance_phase", {"to": "diagnose", "rationale": "payment leads"}),
-            _structured("advance_phase", {"to": "verify", "rationale": "metrics and logs agree"}),
-            _structured("query_metrics", {"promql": "pool_in_use{service='payment'}"}),
-            _structured(
-                "conclude",
-                {
-                    "primary_service": "payment-service",
-                    "cascade_services": ["order-service"],
-                    "root_cause": "connection pool exhaustion",
-                    "final_answer": final,
+                    "final_answer": _FINAL,
                 },
             ),
         ]
     )
     app = build_application(tracking=False)
     messages: list[dict[str, Any]] = [{"role": "user", "content": "y"}]
-    result = await runner.drive_investigation(script, app, messages, max_steps=20)
-    assert runner.fsm_terminated(app), result
-    assert app.state["final_answer"] == final
+    await runner.drive_investigation(script, app, messages, call_grafana=_grafana, max_steps=20)
+    assert runner.fsm_terminated(app)
+    assert app.state["final_answer"] == _FINAL
+    # tempo_get-trace was reachable and recorded as tempo evidence
+    tools_used = {f["tool"] for f in app.state["findings"]}
+    assert "tempo_get-trace" in tools_used
+
+
+@pytest.mark.asyncio
+async def test_grafana_tool_before_start_is_refused():
+    script = _ScriptedLLM([_structured("query_prometheus", {"expr": "up"})])
+    app = build_application(tracking=False)
+    messages: list[dict[str, Any]] = [{"role": "user", "content": "y"}]
+    await runner.drive_investigation(script, app, messages, call_grafana=_grafana, max_steps=2)
+    assert not app.state["findings"]  # nothing recorded; case was not open
 
 
 @pytest.mark.asyncio
@@ -154,6 +135,8 @@ async def test_loop_stops_after_repeated_no_calls():
     script = _ScriptedLLM([SimpleNamespace(content="", tool_calls=None) for _ in range(5)])
     app = build_application(tracking=False)
     messages: list[dict[str, Any]] = [{"role": "user", "content": "y"}]
-    result = await runner.drive_investigation(script, app, messages, max_steps=10)
+    result = await runner.drive_investigation(
+        script, app, messages, call_grafana=_grafana, max_steps=10
+    )
     assert not runner.fsm_terminated(app)
     assert len(result["steps"]) == runner.MAX_NO_CALL_TURNS

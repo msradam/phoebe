@@ -41,7 +41,7 @@ from typing import Any, cast
 
 sys.path.insert(0, "/app")
 
-from theodosia.upstream import bind_upstream  # noqa: E402
+from theodosia.upstream import bind_upstream, call_upstream  # noqa: E402
 
 from phoebe import build_application  # noqa: E402
 
@@ -164,14 +164,19 @@ def assistant_message(content: str | None, calls: list[ToolCall]) -> dict[str, A
     }
 
 
-# == FSM actions as the ONLY LLM tools (single surface) ==============
+# == FSM control tools ===============================================
+# These three are the FSM's own actions: open the case, move through the
+# phases, and conclude. They are added alongside the real Grafana toolset,
+# which the runner discovers at connect time and passes through (see
+# build_tools / run_agent). The FSM gates the phases and termination; it does
+# not restrict which Grafana tool the agent calls.
 
 FSM_TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
             "name": "start_investigation",
-            "description": "Open the investigation. Call this first.",
+            "description": "Open the investigation. Call this first. The server discovers the Grafana datasources and the telemetry schema and reports them in state.current_prompt.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -179,51 +184,6 @@ FSM_TOOLS: list[dict[str, Any]] = [
                     "scenario_time": {"type": "string"},
                 },
                 "required": ["incident_description"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "query_metrics",
-            "description": "Run a PromQL query against Grafana and record it. The server handles the datasource + time window.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "promql": {"type": "string"},
-                    "hypothesis": {"type": "string"},
-                },
-                "required": ["promql"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "query_logs",
-            "description": "Run a LogQL query against Grafana and record it.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "logql": {"type": "string"},
-                    "hypothesis": {"type": "string"},
-                },
-                "required": ["logql"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "query_traces",
-            "description": "Run a TraceQL search against Grafana and record it.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "traceql": {"type": "string"},
-                    "hypothesis": {"type": "string"},
-                },
-                "required": ["traceql"],
             },
         },
     },
@@ -329,9 +289,7 @@ async def step_fsm(app: Any, action: str, inputs: dict[str, Any]) -> dict[str, A
             "current_prompt": sv.get("current_prompt"),
             "final_answer_set": sv.get("final_answer") is not None,
         },
-        # Surface the actual query result so the agent can quantify and cite it,
-        # rather than reasoning from the short prompt summary alone.
-        "result": (last or {}).get("result_summary") if action.startswith("query_") else None,
+        "result": (last or {}).get("result_summary") if action == "record_probe" else None,
     }
 
 
@@ -398,11 +356,59 @@ _NUDGE = (
 )
 
 
+def backend_for(tool: str) -> str | None:
+    """Map a Grafana tool name to a telemetry backend for the cross-reference
+    gate. Non-telemetry tools (dashboards, annotations, alerting) return None."""
+    t = (tool or "").lower()
+    if "prometheus" in t:
+        return "prometheus"
+    if "loki" in t:
+        return "loki"
+    if "tempo" in t or "trace" in t:
+        return "tempo"
+    return None
+
+
+def _result_summary(result: Any, limit: int = 1200) -> str:
+    s = result if isinstance(result, str) else json.dumps(result, default=str)
+    return s[:limit]
+
+
+def _case_open(app: Any) -> bool:
+    try:
+        s = app.state
+        return bool(s.get("incident_description")) and s.get("final_answer") in (None, "")
+    except Exception:
+        return False
+
+
+async def discover_grafana_tools(session: Any) -> list[dict[str, Any]]:
+    """Convert the upstream Grafana MCP tools into OpenAI function defs so the
+    agent has the full toolset, the same surface the bench's base agent gets."""
+    result = await session.list_tools()
+    defs: list[dict[str, Any]] = []
+    for t in result.tools:
+        schema = getattr(t, "inputSchema", None) or {"type": "object", "properties": {}}
+        defs.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": (getattr(t, "description", "") or "")[:300],
+                    "parameters": schema,
+                },
+            }
+        )
+    return defs
+
+
 async def drive_investigation(
     complete: Callable[[list[dict[str, Any]]], Awaitable[Any]],
     fsm_app: Any,
     messages: list[dict[str, Any]],
     *,
+    call_grafana: Callable[[str, dict[str, Any]], Awaitable[Any]] | None = None,
+    infer_backend: Callable[[str], str | None] = backend_for,
     max_steps: int = MAX_STEPS,
     log: Callable[[str], None] = lambda _s: None,
 ) -> dict[str, Any]:
@@ -442,9 +448,42 @@ async def drive_investigation(
             if c.name in _FSM_ACTION_NAMES:
                 obs = await step_fsm(fsm_app, c.name, c.arguments)
                 tag = obs.get("error", "ok")
-            else:
+            elif call_grafana is None:
                 obs = {"error": "unknown_tool", "tool": c.name}
                 tag = "unknown"
+            elif not _case_open(fsm_app):
+                obs = {
+                    "error": "invalid_transition",
+                    "tool": c.name,
+                    "message": "Call start_investigation before running tools, and do not run tools after conclude.",
+                }
+                tag = "not_open"
+            else:
+                # Full Grafana toolset: execute the real tool, then record it as
+                # evidence (which also enforces the loop guard and feeds the gate).
+                result = await call_grafana(c.name, c.arguments)
+                rec = await step_fsm(
+                    fsm_app,
+                    "record_probe",
+                    {
+                        "tool": c.name,
+                        "backend": infer_backend(c.name),
+                        "query": json.dumps(c.arguments, default=str)[:300],
+                        "result_summary": _result_summary(result),
+                    },
+                )
+                if rec.get("error"):
+                    obs = rec
+                    tag = rec["error"]
+                else:
+                    obs = {
+                        "ok": True,
+                        "tool": c.name,
+                        "result": result,
+                        "phase": rec["state"]["phase"],
+                        "current_prompt": rec["state"]["current_prompt"],
+                    }
+                    tag = "ok"
             log(f"[{step}] {c.name}({tag})")
             messages.append(
                 {"role": "tool", "tool_call_id": c.id, "content": json.dumps(obs, default=str)}
@@ -489,9 +528,16 @@ async def run_agent() -> None:
     async with streamable_http_client(mcp_url) as (read, write, _):  # noqa: SIM117 (keep the session block at its own indent for readability)
         async with ClientSession(read, write) as session:
             await session.initialize()
-            # Bind Grafana as the FSM's upstream. The agent never sees these tools.
+            # Bind Grafana as the FSM's upstream so record_probe / start can reach
+            # it, and expose the full Grafana toolset to the agent. The FSM gates
+            # phases and termination; it does not restrict which tool is called.
             bind_upstream(_SessionUpstream(session))
-            print("Grafana bound as upstream. Agent surface = FSM actions only (single surface).")
+            grafana_tools = await discover_grafana_tools(session)
+            tools = FSM_TOOLS + grafana_tools
+            print(
+                f"Grafana bound. Agent surface = {len(grafana_tools)} Grafana tools "
+                f"+ {len(FSM_TOOLS)} FSM control actions; phases and conclude are gated."
+            )
 
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
@@ -499,16 +545,15 @@ async def run_agent() -> None:
             ]
 
             async def complete(msgs: list[dict[str, Any]]) -> Any:
-                # tool_choice="required": in a single-surface FSM the only way to
-                # finish is conclude(), so an empty (no-tool) turn is always a
-                # defect; force a call and detect termination via fsm_terminated.
-                # Leave temperature at the provider default unless TEMPERATURE is
-                # set: some variance is needed so the model varies a refused probe
-                # instead of repeating it against the loop guard.
+                # tool_choice="required": the only legitimate way to finish is
+                # conclude(), so an empty (no-tool) turn is always a defect; force a
+                # call and detect termination via fsm_terminated. Leave temperature
+                # at the provider default unless TEMPERATURE is set: some variance
+                # lets the model vary a refused probe instead of repeating it.
                 kwargs: dict[str, Any] = {
                     "model": model,
                     "messages": msgs,
-                    "tools": FSM_TOOLS,
+                    "tools": tools,
                     "tool_choice": "required",
                 }
                 if temperature is not None:
@@ -526,6 +571,7 @@ async def run_agent() -> None:
                 complete,
                 fsm_app,
                 messages,
+                call_grafana=lambda name, args: call_upstream("grafana", name, args),
                 max_steps=MAX_STEPS,
                 log=lambda s: print(s, flush=True),
             )

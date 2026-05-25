@@ -82,8 +82,10 @@ def after_probe(
         )
     else:
         lines.append(
-            "You have >=2 backends. When ready: advance_phase(to='diagnose'/'verify', "
-            "rationale=...). conclude needs phase=='verify' + a probe taken during verify."
+            "You have >=2 backends, which is enough. Stop gathering now: "
+            "advance_phase(to='diagnose'), then advance_phase(to='verify'), run one "
+            "confirming probe, and conclude(...). Do not keep exploring tools; the "
+            "phase has a probe budget and will refuse further probing."
         )
     return "\n".join(lines)
 

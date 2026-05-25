@@ -1,21 +1,21 @@
-"""phoebe Burr Application: SRE incident investigation over Grafana, via Theodosia upstream.
+"""phoebe Burr Application: SRE incident investigation over Grafana.
 
-Single surface: the agent sees ONLY the FSM's actions. The query actions
-drive Grafana's MCP server through Theodosia (``call_upstream("grafana",
-...)``): the FSM owns the Grafana plumbing (datasource discovery, time
-windows, query types) and exposes a clean ``query_metrics(promql)`` /
-``query_logs(logql)`` / ``query_traces(traceql)`` to the agent. Every query
-happens inside an action, so it advances state (ledger). Driving the
-telemetry through the FSM action, rather than a separate query surface, is
-what lets a mid-size model walk the investigation to a conclusion.
+The FSM is an invariant, not a toolbox. It does not narrow the agent's tools;
+the agent has the full Grafana toolset (the runner passes the real Grafana MCP
+tools through). What the FSM enforces is the procedure: phases
+(triage -> diagnose -> verify), a cross-reference gate, and a terminal that
+cannot fire early. Every tool call is recorded as evidence via record_probe so
+the audit trail and the gate stay honest, but which tool the agent calls is the
+agent's choice.
 
-Phases (state variable): triage -> diagnose -> verify.
-Actions: start_investigation, query_metrics, query_logs, query_traces,
-advance_phase, conclude.
+Actions: start_investigation (open the case, discover datasources/schema),
+record_probe (one recorded Grafana call; the runner executes the real tool),
+advance_phase (triage -> diagnose -> verify), conclude (gated terminal).
 
-Requires an upstream "grafana" server bound (mount(upstream={"grafana":...})
-standalone, or the Harbor runner binding its Grafana session). Tests bind
-a mock.
+This is the open, general investigation invariant, the stepping stone, not a
+fully integrated product. Requires an upstream "grafana" server bound
+(mount(upstream={"grafana":...}) standalone, or the Harbor runner binding its
+Grafana session). Tests bind a mock.
 """
 
 from __future__ import annotations
@@ -35,6 +35,13 @@ _DEFAULT_PHASE = "triage"
 _LOOP_GUARD_WINDOW = 4
 _MIN_BACKENDS_TO_CONCLUDE = 2
 _DEFAULT_LOOKBACK_HOURS = 6
+# Probe budgets. The toolset is open, but probing is bounded so a capable but
+# undisciplined model converges to a conclusion instead of exploring forever.
+# Once a phase (or the whole investigation) hits its budget, the action space
+# narrows to advance_phase / conclude. This is the phase transition gating the
+# action space, the invariant's job, without limiting which tool is used.
+_PROBE_BUDGET_PER_PHASE = 5
+_PROBE_BUDGET_TOTAL = 12
 
 
 def _now() -> str:
@@ -109,53 +116,19 @@ async def _discover_schema(uids: dict[str, Any]) -> dict[str, Any]:
     return schema
 
 
+_TELEMETRY_BACKENDS = ("prometheus", "loki", "tempo")
+
+
 def _distinct_backends(findings: list[dict[str, Any]]) -> set[str]:
-    return {f["backend"] for f in findings if f.get("backend")}
+    # Only the three telemetry backends count toward the cross-reference gate.
+    # Dashboard/annotation/alerting calls are recorded but do not satisfy
+    # "evidence from >= 2 distinct backends".
+    return {f["backend"] for f in findings if f.get("backend") in _TELEMETRY_BACKENDS}
 
 
 def _summarize(result: Any, limit: int = 1200) -> str:
     s = result if isinstance(result, str) else __import__("json").dumps(result, default=str)
     return s[:limit]
-
-
-async def _record(
-    state: State[Any], *, backend: str, query: str, result: Any, hypothesis: str | None
-) -> State[Any]:
-    phase = state.get("phase") or _DEFAULT_PHASE
-    summary = _summarize(result)
-    finding = {
-        "backend": backend,
-        "query": query,
-        "result_summary": summary,
-        "hypothesis": (hypothesis or "").strip(),
-        "phase": phase,
-        "ts": _now(),
-    }
-    findings = [*(state.get("findings") or []), finding]
-    distinct = sorted(_distinct_backends(findings))
-    recent = state.get("recent_probe_hashes") or []
-    return state.update(
-        findings=findings,
-        distinct_backends=distinct,
-        recent_probe_hashes=[*recent, f"{backend}::{query.strip()}"][-(_LOOP_GUARD_WINDOW * 2) :],
-        current_prompt=prompts.after_probe(
-            backend=backend,
-            summary=summary,
-            phase=phase,
-            distinct_backends=distinct,
-            n_probes=len(findings),
-        ),
-        log=[*state["log"], f"{backend} probe: {summary[:60]}"],
-    )
-
-
-def _loop_guard(state: State[Any], backend: str, query: str) -> None:
-    recent = state.get("recent_probe_hashes") or []
-    if f"{backend}::{query.strip()}" in recent[-_LOOP_GUARD_WINDOW:]:
-        raise ValueError(
-            f"loop guard: this exact {backend} query ran within the last "
-            f"{_LOOP_GUARD_WINDOW} probes. Vary it, or advance_phase / conclude."
-        )
 
 
 # == actions ==========================================================
@@ -222,127 +195,84 @@ async def start_investigation(
 
 
 @action(
-    reads=[
-        "phase",
-        "findings",
-        "distinct_backends",
-        "recent_probe_hashes",
-        "ds_uids",
-        "window",
-        "log",
-    ],
+    reads=["phase", "findings", "distinct_backends", "recent_probe_hashes", "log"],
     writes=["findings", "distinct_backends", "recent_probe_hashes", "current_prompt", "log"],
 )
-async def query_metrics(
-    state: State[Any], promql: str, hypothesis: str | None = None
+async def record_probe(
+    state: State[Any],
+    tool: str,
+    backend: str | None = None,
+    query: str = "",
+    result_summary: str = "",
+    hypothesis: str | None = None,
 ) -> State[Any]:
-    """Run a PromQL query against Grafana (through Theodosia) and record it.
+    """Record one Grafana tool call as evidence.
+
+    The agent has the full Grafana toolset; the runner executes the actual tool
+    and records the call here so the audit trail and the cross-reference gate
+    stay honest. The FSM does not restrict which tool is called, only that
+    conclude cannot fire until the phase gates are met.
 
     Args:
-        promql: the PromQL expression.
+        tool: the Grafana tool that was called (e.g. ``query_prometheus``).
+        backend: ``prometheus`` / ``loki`` / ``tempo`` when the call hit a
+            telemetry datasource, else ``None`` (counts toward the >=2 backend
+            gate only for the telemetry backends).
+        query: a short representation of the call arguments.
+        result_summary: the (already summarized) result text.
         hypothesis: optional short reason for this probe.
     """
-    promql = (promql or "").strip()
-    if not promql:
-        raise ValueError("promql must not be empty")
-    _loop_guard(state, "prometheus", promql)
-    uid = (state.get("ds_uids") or {}).get("prometheus")
-    win = state.get("window") or {}
-    result = await call_upstream(
-        "grafana",
-        "query_prometheus",
-        {
-            "datasourceUid": uid,
-            "expr": promql,
-            "queryType": "range",
-            "startTime": win.get("start"),
-            "endTime": win.get("end"),
-            "stepSeconds": 300,
-        },
-    )
-    return await _record(
-        state, backend="prometheus", query=promql, result=result, hypothesis=hypothesis
-    )
-
-
-@action(
-    reads=[
-        "phase",
-        "findings",
-        "distinct_backends",
-        "recent_probe_hashes",
-        "ds_uids",
-        "window",
-        "log",
-    ],
-    writes=["findings", "distinct_backends", "recent_probe_hashes", "current_prompt", "log"],
-)
-async def query_logs(state: State[Any], logql: str, hypothesis: str | None = None) -> State[Any]:
-    """Run a LogQL query against Grafana (through Theodosia) and record it.
-
-    Args:
-        logql: the LogQL query.
-        hypothesis: optional short reason for this probe.
-    """
-    logql = (logql or "").strip()
-    if not logql:
-        raise ValueError("logql must not be empty")
-    _loop_guard(state, "loki", logql)
-    uid = (state.get("ds_uids") or {}).get("loki")
-    win = state.get("window") or {}
-    result = await call_upstream(
-        "grafana",
-        "query_loki_logs",
-        {
-            "datasourceUid": uid,
-            "logql": logql,
-            "startRfc3339": win.get("start"),
-            "endRfc3339": win.get("end"),
-            "limit": 50,
-        },
-    )
-    return await _record(state, backend="loki", query=logql, result=result, hypothesis=hypothesis)
-
-
-@action(
-    reads=[
-        "phase",
-        "findings",
-        "distinct_backends",
-        "recent_probe_hashes",
-        "ds_uids",
-        "window",
-        "log",
-    ],
-    writes=["findings", "distinct_backends", "recent_probe_hashes", "current_prompt", "log"],
-)
-async def query_traces(
-    state: State[Any], traceql: str, hypothesis: str | None = None
-) -> State[Any]:
-    """Run a TraceQL search against Grafana (through Theodosia) and record it.
-
-    Args:
-        traceql: the TraceQL query.
-        hypothesis: optional short reason for this probe.
-    """
-    traceql = (traceql or "").strip()
-    if not traceql:
-        raise ValueError("traceql must not be empty")
-    _loop_guard(state, "tempo", traceql)
-    uid = (state.get("ds_uids") or {}).get("tempo")
-    win = state.get("window") or {}
-    result = await call_upstream(
-        "grafana",
-        "tempo_traceql-search",
-        {
-            "datasourceUid": uid,
-            "query": traceql,
-            "start": win.get("start"),
-            "end": win.get("end"),
-        },
-    )
-    return await _record(
-        state, backend="tempo", query=traceql, result=result, hypothesis=hypothesis
+    tool = (tool or "").strip()
+    if not tool:
+        raise ValueError("record_probe requires a tool name")
+    be = (backend or "").strip().lower() or None
+    if be not in (None, *_TELEMETRY_BACKENDS):
+        be = None
+    phase = state.get("phase") or _DEFAULT_PHASE
+    existing = state.get("findings") or []
+    if len(existing) >= _PROBE_BUDGET_TOTAL:
+        raise ValueError(
+            f"probe budget exhausted ({len(existing)} probes). Do not gather more; "
+            "advance_phase to verify if needed, then conclude with what you have."
+        )
+    phase_probes = sum(1 for f in existing if f.get("phase") == phase)
+    if phase_probes >= _PROBE_BUDGET_PER_PHASE:
+        raise ValueError(
+            f"phase budget reached: {phase_probes} probes already recorded in the "
+            f"{phase} phase. Stop gathering and advance_phase or conclude with what "
+            "you have."
+        )
+    key = f"{be or tool}::{(query or '').strip()}"
+    recent = state.get("recent_probe_hashes") or []
+    if key in recent[-_LOOP_GUARD_WINDOW:]:
+        raise ValueError(
+            f"loop guard: this exact {tool} call ran within the last "
+            f"{_LOOP_GUARD_WINDOW} probes. Vary it, or advance_phase / conclude."
+        )
+    summary = _summarize(result_summary)
+    finding = {
+        "backend": be,
+        "tool": tool,
+        "query": query,
+        "result_summary": summary,
+        "hypothesis": (hypothesis or "").strip(),
+        "phase": phase,
+        "ts": _now(),
+    }
+    findings = [*(state.get("findings") or []), finding]
+    distinct = sorted(_distinct_backends(findings))
+    return state.update(
+        findings=findings,
+        distinct_backends=distinct,
+        recent_probe_hashes=[*recent, key][-(_LOOP_GUARD_WINDOW * 2) :],
+        current_prompt=prompts.after_probe(
+            backend=be or tool,
+            summary=summary,
+            phase=phase,
+            distinct_backends=distinct,
+            n_probes=len(findings),
+        ),
+        log=[*state["log"], f"{tool} probe: {summary[:60]}"],
     )
 
 
@@ -435,7 +365,7 @@ async def conclude(
 
 # == graph (hub) ======================================================
 
-_HUB = ("query_metrics", "query_logs", "query_traces", "advance_phase", "conclude")
+_HUB = ("record_probe", "advance_phase", "conclude")
 _OPEN = Condition.expr("final_answer is None")
 
 
@@ -453,9 +383,7 @@ def build_application(tracking: bool = True):
         ApplicationBuilder()
         .with_actions(
             start_investigation=start_investigation,
-            query_metrics=query_metrics,
-            query_logs=query_logs,
-            query_traces=query_traces,
+            record_probe=record_probe,
             advance_phase=advance_phase,
             conclude=conclude,
         )
@@ -507,15 +435,14 @@ def build_server(grafana_mcp_url: str | None = None):
         name="phoebe",
         upstream={"grafana": url},
         instructions=(
-            "SRE incident-investigation FSM that drives a Grafana MCP server "
-            "THROUGH this server (you are not given Grafana tools directly). "
-            "Walk: start_investigation(incident_description, scenario_time) -> "
-            "query_metrics(promql) / query_logs(logql) / query_traces(traceql) "
-            "[the FSM runs these against Grafana and records them] -> "
-            "advance_phase(to, rationale) triage->diagnose->verify -> "
-            "conclude(primary_service, root_cause, final_answer, cascade_services). "
-            "conclude needs phase=='verify', >=2 backends, and a verify-phase "
-            "finding. Read state.current_prompt after each step."
+            "SRE incident-investigation invariant. Walk: "
+            "start_investigation(incident_description, scenario_time), then gather "
+            "evidence, then advance_phase(to, rationale) triage->diagnose->verify, "
+            "then conclude(primary_service, root_cause, final_answer, cascade_services). "
+            "conclude needs phase=='verify', findings from >=2 telemetry backends, "
+            "and a probe recorded during verify. Read state.current_prompt after "
+            "each step. The full Grafana toolset is exposed by the Harbor runner; "
+            "record_probe logs each tool call as evidence."
         ),
     )
 
