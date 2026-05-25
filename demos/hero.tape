@@ -19,8 +19,10 @@ Type "source .venv/bin/activate >/dev/null 2>&1 || true"
 Enter
 Type "clear"
 Enter
-Show
-
+# Launch while hidden; narrate.py clears the screen as its first action, so the
+# recording opens directly on the narration with no prompt or command line.
 Type "python scripts/narrate.py"
 Enter
-Sleep 17s
+Sleep 1500ms
+Show
+Sleep 16s

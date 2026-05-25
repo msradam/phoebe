@@ -18,8 +18,9 @@ Type "source .venv/bin/activate >/dev/null 2>&1 || true"
 Enter
 Type "clear"
 Enter
-Show
-
+# Launch while hidden; narrate.py clears the screen as its first action.
 Type "python scripts/narrate.py scripts/hero_trace_sonnet.json"
 Enter
-Sleep 15s
+Sleep 1500ms
+Show
+Sleep 14s

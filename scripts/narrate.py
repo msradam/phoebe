@@ -99,6 +99,7 @@ def _wrap(s: str, width: int, indent: str) -> str:
 
 
 def main() -> None:
+    console.clear()  # wipe the launch command line so a recording opens clean
     trace = json.loads(_TRACE.read_text())
     steps: list[dict[str, Any]] = trace["steps"]
 
