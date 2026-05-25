@@ -15,11 +15,11 @@ start_investigation            open the case; discover datasources + schema
 
 Hub topology: every action is reachable from every other. The methodology is enforced inside action bodies, not by narrowing the graph or the toolset (this is what lets a mid-size model *drive* the FSM instead of fighting it). `conclude` is gated: phase must be `verify`, you need evidence from ≥2 distinct telemetry backends, and at least one probe must have run during the verify phase. Each phase has a query budget, so once it is spent the only moves are `advance_phase` or `conclude`. A repeated identical probe is refused ("vary the probe").
 
-Two models, same FSM, same incident, both sound through the harness:
+A 1T-parameter open model (Kimi K2.6) stepping through a gated investigation on rails:
 
 ![Kimi K2.6 driven through the investigation by Theodosia](demos/hero.gif)
 
-![Claude Sonnet 4.6 driven through the same investigation](demos/hero_sonnet.gif)
+On five Grafana o11y-bench tasks (four investigation-category plus one PromQL task), Pass^3, this FSM scores a mean of **0.765** with Kimi K2.6 via Together, against **0.717** for the same model with the raw Grafana toolset and no FSM. This is a partial run, not the full 11-task investigation category, so it is not directly comparable to the o11y-bench leaderboard's per-category scores; a clean full-category run is pending. See [RESULTS.md](RESULTS.md) for the breakdown and caveats.
 
 ## What it gives the caller
 
