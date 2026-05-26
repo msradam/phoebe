@@ -19,7 +19,7 @@ A 1T-parameter open model (Kimi K2.6) stepping through a gated investigation on 
 
 ![Kimi K2.6 driven through the investigation by Theodosia](demos/hero.gif)
 
-On o11y-bench's investigation tasks, the same model (Kimi K2.6) was run two ways: free-ranging with the raw Grafana toolset, and on rails through this FSM. The recurring free-ranging failure is an empty final answer, the model investigates and never commits to a conclusion. On rails, the `conclude` gate forces it to commit. Three grader-verified pairs, in o11y-bench's own words, are in [bench/case_studies](bench/case_studies) and the [case study writeup](https://msradam.github.io/theodosia/case-study/). This is a qualitative comparison, not a leaderboard claim.
+On one o11y-bench investigation task, the same model (Kimi K2.6) was run two ways: free-ranging with the raw Grafana toolset, and on rails through this FSM. Free-ranging, it never produced a final answer on any of three runs (all scored 0.15, all empty). On rails, the `conclude` gate forced it to commit and it reached the correct root cause (1.0, all checks). The grader-verified evidence is in [bench/case_studies](bench/case_studies) and the [case study writeup](https://msradam.github.io/theodosia/case-study/). This is a single illustrative case, not a leaderboard claim; an aggregate run across the category is pending.
 
 ## What it gives the caller
 
