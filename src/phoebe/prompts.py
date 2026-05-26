@@ -1,8 +1,12 @@
 """Prompt fragments emitted into ``state.current_prompt`` after each step.
 
-These guide the caller LLM on what to do next. In the circe-style design
-the query actions ARE the operations, so the prompts are short nudges
-toward the next sensible move, not heavyweight phase scripts.
+Experiment A: enforce completion and verification structure, not investigative
+content. The prompts tell the agent it must gather evidence, verify a leading
+hypothesis, and conclude (never trail off). They do NOT prescribe how to
+investigate (no per-service blast-radius script, no cross-reference mandate, no
+deployment hint); that channels the agent below a free agent's exploration. The
+graph enforces order, a verify-phase probe, and termination; the agent
+investigates freely within that.
 """
 
 from __future__ import annotations
@@ -42,36 +46,15 @@ def after_start(
         f"Investigating: {incident_description}\n"
         f"Scenario clock: {scenario_time}\n\n"
         f"{schema_block(schema)}"
-        "Phase: TRIAGE. Start gathering evidence with the Grafana tools "
-        "(query Prometheus, then Loki, then Tempo if useful). Each call is "
-        "recorded as evidence.\n\n"
-        "Cross-reference at least two backends, and establish the full blast "
-        "radius before you wrap up: query per service so you can say which "
-        "services ARE and are NOT affected. When the affected services are "
-        "covered and you have a leading hypothesis, advance_phase(to='diagnose', "
-        "rationale=...), then advance_phase(to='verify', ...) and run a "
-        "confirming probe before conclude(...).\n\n"
-        "Investigation discipline:\n"
-        "- Quantify from the query results you get back (counts, rates, shares). "
-        "Read the 'result' field on each tool response; do not estimate numbers.\n"
-        "- For any count or share, compute it from an aggregate query over the "
-        "full window (a count of all matching log lines, or count_over_time / "
-        "sum by in PromQL). Do not compute a share from the rows visible in a "
-        "previous result: that is only a page of the data and the share will be "
-        "wrong.\n"
-        "- Establish the blast radius: query per service so you can say which "
-        "services ARE and are NOT affected, not just the loudest one.\n"
-        "- Check whether a recent deployment, version change, or config rollout "
-        "lines up with the incident onset: look for version labels, deploy "
-        "markers, or rollout entries in metrics and logs, even if the incident "
-        "description does not mention one. If a recent change explains the "
-        "symptoms, name it (with the version) in your conclusion; if the evidence "
-        "does not support a deployment cause, say so. Do not pin the incident on "
-        "a rollout without evidence: some incidents have no deploy cause.\n"
-        "- If the incident names a specific endpoint, path, service, or prior "
-        "incident, query that directly before concluding.\n"
-        "- If you query traces, note a representative trace ID from the result so "
-        "you can cite it."
+        "Phase: TRIAGE. Investigate freely with the Grafana tools (Prometheus, "
+        "Loki, Tempo). Each call is recorded as evidence; read the 'result' field "
+        "on each response and quantify from it.\n\n"
+        "When you have a leading hypothesis, advance_phase(to='diagnose', "
+        "rationale=...), then advance_phase(to='verify', ...), run one probe that "
+        "confirms or refutes it, and conclude(primary_service, root_cause, "
+        "final_answer, cascade_services=[]). You must reach conclude; do not end "
+        "the session by trailing off. conclude is blocked until a probe is recorded "
+        "during the verify phase."
     )
 
 
@@ -86,30 +69,15 @@ def after_probe(
 ) -> str:
     lines = [
         f"Recorded {backend} probe ({n_probes} total). Phase: {phase.upper()}.",
-        f"Backends covered so far: {distinct_backends}.",
-        f"Last result (read it; quantify from it, do not estimate): {summary[:600]}",
+        f"Last result (read it; quantify from it): {summary[:600]}",
+        "When you have a leading hypothesis, advance to diagnose, then verify, run "
+        "one confirming probe, and conclude with a committed, evidence-cited answer.",
     ]
-    if len(distinct_backends) < 2:
-        lines.append(
-            "You have only one backend. Cross-reference another "
-            "(logs if you queried metrics, or vice versa) before you can verify."
-        )
-    else:
-        lines.append(
-            "You have cross-referenced >=2 backends. Keep going until you have "
-            "established the full blast radius: query per service so you can state "
-            "which services ARE and are NOT affected, and address any specific "
-            "endpoint, prior incident, or rollout the task named. Once the affected "
-            "services are covered, advance_phase(to='diagnose'), then "
-            "advance_phase(to='verify'), run one confirming probe, and conclude(...)."
-        )
     if over_budget:
         lines.append(
-            f"You are at the probe budget ({n_probes} probes). Do not keep "
-            "gathering broadly. On your next moves, advance to verify, run one "
-            "confirming probe, and conclude with the evidence you have. A "
-            "committed answer with minor gaps scores far better than ending with "
-            "no answer; the session must not trail off without calling conclude()."
+            f"You are at the probe budget ({n_probes} probes). Wrap up: advance to "
+            "verify, run one confirming probe, and conclude with the evidence you "
+            "have. A committed answer beats trailing off with no answer."
         )
     return "\n".join(lines)
 
@@ -117,29 +85,14 @@ def after_probe(
 def after_advance(to: str, distinct_backends: list[str], n_probes: int) -> str:
     if to == "verify":
         return (
-            f"Phase: VERIFY. Backends covered: {distinct_backends} ({n_probes} probes).\n"
-            "Run ONE focused probe that confirms (or refutes) your leading "
-            "hypothesis, then call conclude(primary_service, root_cause, "
-            "final_answer, cascade_services=[]). conclude is blocked until a "
-            "probe runs during this verify phase.\n\n"
-            "Before you conclude, make sure your final_answer:\n"
-            "- quantifies the impact with a number computed from an aggregate "
-            "query over the full window (not estimated, and not a share computed "
-            "from the few rows visible in a previous result);\n"
-            "- states the blast radius: which services are affected and which are "
-            "not, and whether the incident is isolated or broad;\n"
-            "- separates the primary/root-cause service from downstream cascade;\n"
-            "- cites a representative trace ID if you queried traces;\n"
-            "- addresses any specific endpoint or prior incident the task named, "
-            "and whether a recent deployment or rollout explains the incident "
-            "(name the version if so, or say the evidence does not support one). "
-            "If you have not checked for a recent change yet, do that now.\n\n"
-            "If you are running low on budget, conclude with the evidence you have "
-            "rather than gathering more: a committed answer with caveats beats no "
-            "answer."
+            f"Phase: VERIFY. {n_probes} probes recorded. Run one probe that confirms "
+            "or refutes your leading hypothesis, then conclude(primary_service, "
+            "root_cause, final_answer, cascade_services=[]). conclude is blocked "
+            "until a probe runs during this verify phase. Your final_answer should "
+            "state the conclusion and cite the evidence you gathered. You must "
+            "conclude; do not trail off."
         )
     return (
-        f"Phase: {to.upper()}. Keep gathering / cross-referencing evidence. "
-        "Advance to 'verify' once you have probes from >=2 backends and a "
-        "leading hypothesis."
+        f"Phase: {to.upper()}. Keep investigating. Advance to 'verify' once you have "
+        "a leading hypothesis, then run a confirming probe and conclude."
     )
