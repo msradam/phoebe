@@ -45,9 +45,11 @@ def after_start(
         "Phase: TRIAGE. Start gathering evidence with the Grafana tools "
         "(query Prometheus, then Loki, then Tempo if useful). Each call is "
         "recorded as evidence.\n\n"
-        "Cross-reference at least two backends. When you have a leading "
-        "hypothesis, advance_phase(to='diagnose', rationale=...), then "
-        "(after >=2 backends) advance_phase(to='verify', ...) and run a "
+        "Cross-reference at least two backends, and establish the full blast "
+        "radius before you wrap up: query per service so you can say which "
+        "services ARE and are NOT affected. When the affected services are "
+        "covered and you have a leading hypothesis, advance_phase(to='diagnose', "
+        "rationale=...), then advance_phase(to='verify', ...) and run a "
         "confirming probe before conclude(...).\n\n"
         "Investigation discipline:\n"
         "- Quantify from the query results you get back (counts, rates, shares). "
@@ -68,6 +70,7 @@ def after_probe(
     phase: str,
     distinct_backends: list[str],
     n_probes: int,
+    over_budget: bool = False,
 ) -> str:
     lines = [
         f"Recorded {backend} probe ({n_probes} total). Phase: {phase.upper()}.",
@@ -81,10 +84,18 @@ def after_probe(
         )
     else:
         lines.append(
-            "You have >=2 backends, which is enough. Stop gathering now: "
-            "advance_phase(to='diagnose'), then advance_phase(to='verify'), run one "
-            "confirming probe, and conclude(...). Do not keep exploring tools; the "
-            "phase has a probe budget and will refuse further probing."
+            "You have cross-referenced >=2 backends. Keep going until you have "
+            "established the full blast radius: query per service so you can state "
+            "which services ARE and are NOT affected, and address any specific "
+            "endpoint, prior incident, or rollout the task named. Once the affected "
+            "services are covered, advance_phase(to='diagnose'), then "
+            "advance_phase(to='verify'), run one confirming probe, and conclude(...)."
+        )
+    if over_budget:
+        lines.append(
+            f"You have gathered {n_probes} probes. If the blast radius is already "
+            "covered, wrap up now: advance to verify and conclude. Otherwise finish "
+            "the few remaining service queries first."
         )
     return "\n".join(lines)
 

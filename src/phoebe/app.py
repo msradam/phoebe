@@ -35,12 +35,12 @@ _DEFAULT_PHASE = "triage"
 _LOOP_GUARD_WINDOW = 4
 _MIN_BACKENDS_TO_CONCLUDE = 2
 _DEFAULT_LOOKBACK_HOURS = 6
-# Probe budgets. The toolset is open, but probing is bounded so a capable but
-# undisciplined model converges to a conclusion instead of exploring forever.
-# Once a phase (or the whole investigation) hits its budget, the action space
-# narrows to advance_phase / conclude. This is the phase transition gating the
-# action space, the invariant's job, without limiting which tool is used.
-_PROBE_BUDGET_PER_PHASE = 5
+# Probe budget, advisory only. The toolset is open and probing is never
+# refused; this is the telemetry count at which after_probe begins nudging the
+# model to wrap up. Enforcement lives in the procedure (phase order, mandatory
+# verify probe, the conclude gate), not in the probe count. A binding cap here
+# removed exploration the model needs on broad blast-radius incidents and drove
+# the FSM below raw prompting. See record_probe.
 _PROBE_BUDGET_TOTAL = 12
 
 
@@ -236,30 +236,16 @@ async def record_probe(
         be = None
     phase = state.get("phase") or _DEFAULT_PHASE
     existing = state.get("findings") or []
-    # Budgets count only telemetry queries: discovery / documentation calls
-    # (list_datasources, label listings, traceql docs) carry backend=None and
-    # must not starve a phase of its real queries.
+    # The probe budget is advisory, not enforcement. We count telemetry probes
+    # (Prometheus / Loki / Tempo; discovery calls carry backend=None and don't
+    # count) and surface the count in current_prompt to nudge the model toward
+    # wrapping up, but we never refuse a probe. A binding cap removes the
+    # exploration the model needs on broad blast-radius incidents (covering five
+    # services costs more than a flat cap allows) and drove the FSM below raw
+    # prompting. The enforcement lives in the procedure (phase order, mandatory
+    # verify probe, the conclude gate), not in the probe count.
     telemetry = [f for f in existing if f.get("backend") in _TELEMETRY_BACKENDS]
-    is_telemetry = be in _TELEMETRY_BACKENDS
-    verify_probe_exists = any(f.get("phase") == "verify" for f in telemetry)
-    # conclude requires a telemetry probe recorded during verify; always permit
-    # that one mandatory confirming probe, even past budget, so a thorough
-    # investigation that spent its budget earlier cannot deadlock at conclude.
-    mandatory_verify = phase == "verify" and is_telemetry and not verify_probe_exists
-    if is_telemetry and not mandatory_verify:
-        if len(telemetry) >= _PROBE_BUDGET_TOTAL:
-            raise ValueError(
-                f"probe budget exhausted ({len(telemetry)} telemetry probes). Do not "
-                "gather more; advance_phase to verify if needed, then conclude. One "
-                "confirming probe is still allowed during the verify phase."
-            )
-        phase_probes = sum(1 for f in telemetry if f.get("phase") == phase)
-        if phase_probes >= _PROBE_BUDGET_PER_PHASE:
-            raise ValueError(
-                f"phase budget reached: {phase_probes} telemetry probes already recorded "
-                f"in the {phase} phase. Stop gathering and advance_phase or conclude with "
-                "what you have."
-            )
+    over_budget = (be in _TELEMETRY_BACKENDS) and len(telemetry) >= _PROBE_BUDGET_TOTAL
     key = f"{be or tool}::{(query or '').strip()}"
     recent = state.get("recent_probe_hashes") or []
     if key in recent[-_LOOP_GUARD_WINDOW:]:
@@ -289,6 +275,7 @@ async def record_probe(
             phase=phase,
             distinct_backends=distinct,
             n_probes=len(findings),
+            over_budget=over_budget,
         ),
         log=[*state["log"], f"{tool} probe: {summary[:60]}"],
     )
