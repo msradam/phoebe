@@ -19,7 +19,7 @@ A 1T-parameter open model (Kimi K2.6) stepping through a gated investigation on 
 
 ![Kimi K2.6 driven through the investigation by Theodosia](demos/hero.gif)
 
-On o11y-bench's full 11-task investigation category, Pass^3, this FSM scores **0.75** with Kimi K2.6 via Together, against **0.68** for the same model on the raw Grafana toolset and no FSM, 33 trials per arm, same grader. Same model, same tasks: the structure, not a bigger model, is the difference. This is a preliminary independent run (n_concurrent=4); a leaderboard submission is in progress. See [RESULTS.md](RESULTS.md) for the breakdown and caveats.
+On o11y-bench's investigation tasks, the same model (Kimi K2.6) was run two ways: free-ranging with the raw Grafana toolset, and on rails through this FSM. The recurring free-ranging failure is an empty final answer, the model investigates and never commits to a conclusion. On rails, the `conclude` gate forces it to commit. Three grader-verified pairs, in o11y-bench's own words, are in [bench/case_studies](bench/case_studies) and the [case study writeup](https://msradam.github.io/theodosia/case-study/). This is a qualitative comparison, not a leaderboard claim.
 
 ## What it gives the caller
 
