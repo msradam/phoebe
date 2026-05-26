@@ -14,6 +14,7 @@ set -euo pipefail
 
 WORK="${WORK:-$HOME/bench}"
 NCONCURRENT="${NCONCURRENT:-2}"   # 2 for a 16GB box; 6-8 on a 32GB+ box
+PHOEBE_REF="${PHOEBE_REF:-main}"  # branch/commit of phoebe to benchmark
 mkdir -p "$WORK" && cd "$WORK"
 
 # 1) Tooling: uv + mise
@@ -24,7 +25,9 @@ eval "$(mise activate bash)" 2>/dev/null || true
 
 # 2) Repos: the harness (public), phoebe (the agent), theodosia from PyPI
 [ -d o11y-bench ] || git clone --depth 1 https://github.com/grafana/o11y-bench
-[ -d phoebe ]     || git clone --depth 1 https://github.com/msradam/phoebe
+[ -d phoebe ]     || git clone https://github.com/msradam/phoebe
+# Pin the phoebe version to benchmark (default main; e.g. a parity-fix branch/commit).
+( cd phoebe && git fetch -q origin "$PHOEBE_REF" 2>/dev/null || true; git checkout -q "$PHOEBE_REF" 2>/dev/null || git checkout -q FETCH_HEAD 2>/dev/null || true; echo "phoebe at: $(git log -1 --oneline)" )
 
 cd o11y-bench
 mise trust -y 2>/dev/null || true
