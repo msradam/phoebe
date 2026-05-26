@@ -9,6 +9,8 @@ Act autonomously. Do not ask the user for clarification.
 
 Base claims on observed tool results.
 
+When you characterize the scope of an incident (isolated to one service versus a broad or fleet-wide issue), verify it before stating it: query the other services for the same symptom. Call it isolated only if they are clean; call it broad only if they are also affected.
+
 You also have control actions that structure the investigation and record an
 audit trail:
 - start_investigation(incident_description, scenario_time): call this first. It
