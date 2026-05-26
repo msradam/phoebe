@@ -19,7 +19,7 @@ A 1T-parameter open model (Kimi K2.6) stepping through a gated investigation on 
 
 ![Kimi K2.6 driven through the investigation by Theodosia](demos/hero.gif)
 
-On one o11y-bench investigation task, the same model (Kimi K2.6) was run two ways: free-ranging with the raw Grafana toolset, and on rails through this FSM. Free-ranging, it never produced a final answer on any of three runs (all scored 0.15, all empty). On rails, the `conclude` gate forced it to commit and it reached the correct root cause (1.0, all checks). The grader-verified evidence is in [bench/case_studies](bench/case_studies) and the [case study writeup](https://msradam.github.io/theodosia/case-study/). This is a single illustrative case, not a leaderboard claim; an aggregate run across the category is pending.
+On o11y-bench investigation tasks, the same model (Kimi K2.6) was run two ways: free-ranging with the raw Grafana toolset, and on rails through this FSM. One failure recurs free-ranging: the agent trails off without delivering an answer. On `service-degradation-rca` it happens on all three runs (0.15, all empty); on `cache-refresh-lag-handoff` it happens on one of three (it solves it twice, fails once), so it misses Pass^3. On rails the `conclude` gate forces a committed, correct conclusion every time (1.0 on all three). Grader-verified evidence for both is in [bench/case_studies](bench/case_studies) and the [case study writeup](https://msradam.github.io/theodosia/case-study/). These are illustrative cases, not a leaderboard claim; an aggregate run is pending.
 
 ## What it gives the caller
 
