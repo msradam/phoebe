@@ -33,7 +33,7 @@ _TRACKER_PROJECT = "phoebe"
 _PHASES = ("triage", "diagnose", "verify")
 _DEFAULT_PHASE = "triage"
 _LOOP_GUARD_WINDOW = 4
-_MIN_BACKENDS_TO_CONCLUDE = 1
+_MIN_BACKENDS_TO_CONCLUDE = 2
 _DEFAULT_LOOKBACK_HOURS = 6
 # Probe budget, advisory only. The toolset is open and probing is never
 # refused; this is the telemetry count at which after_probe begins nudging the
@@ -286,9 +286,9 @@ async def record_probe(
     writes=["phase", "phase_history", "current_prompt", "log"],
 )
 async def advance_phase(state: State[Any], to: str, rationale: str) -> State[Any]:
-    """Advance triage -> diagnose -> verify. to='diagnose' and to='verify' each
-    need >=1 finding (Experiment A: breadth is not prescribed; completion and a
-    verify-phase probe are the enforced structure)."""
+    """Advance triage -> diagnose -> verify. to='diagnose' needs >=1 finding;
+    to='verify' needs findings from >=2 distinct backends (the cross-reference
+    gate, enforced server-side by refusal, not by prompt coaching)."""
     to = (to or "").strip().lower()
     if to not in _PHASES:
         raise ValueError(f"phase must be one of {list(_PHASES)}; got {to!r}")
