@@ -15,7 +15,11 @@ start_investigation            open the case; discover datasources + schema
 
 Hub topology: every action is reachable from every other. The methodology is enforced inside action bodies, not by narrowing the graph or the toolset (this is what lets a mid-size model *drive* the FSM instead of fighting it). `conclude` is gated: phase must be `verify`, you need evidence from ≥2 distinct telemetry backends, and at least one probe must have run during the verify phase. Each phase has a query budget, so once it is spent the only moves are `advance_phase` or `conclude`. A repeated identical probe is refused ("vary the probe").
 
-A 1T-parameter open model (Kimi K2.6) stepping through a gated investigation on rails:
+Phoebe is a state machine an external LLM drives one transition at a time; the graph, not the model, decides what is reachable next:
+
+![The Phoebe investigation FSM, driven one transition at a time](demos/circuit.gif)
+
+A 1T-parameter open model (Kimi K2.6) stepping through that gated investigation on rails:
 
 ![Kimi K2.6 driven through the investigation by Theodosia](demos/hero.gif)
 
