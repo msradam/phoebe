@@ -1,4 +1,5 @@
-Scenario clock: {current_time}
+<context>
+Scenario clock (treat this as "now"): {current_time}
+</context>
 
-Task:
 {statement}
