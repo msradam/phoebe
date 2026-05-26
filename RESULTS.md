@@ -1,4 +1,38 @@
-# Results: o11y-bench investigation set (first run)
+# Results: o11y-bench investigation category
+
+## Headline: full investigation category, Pass^3 (2026-05-26)
+
+The same model scores higher driving the enforced FSM than running free on the
+raw Grafana toolset, on o11y-bench's full 11-task investigation category, Pass^3
+(consistency across three runs per task), graded by o11y-bench's own rubric judge.
+
+| Kimi K2.6 with | Investigation Pass^3 |
+|---|---|
+| Phoebe (this FSM), driven through Theodosia | **0.7524** |
+| the raw Grafana toolset (o11y-bench's default agent) | 0.6842 |
+
+Same model, same tasks, same grader, 33 trials per arm. The only thing that
+changes is whether the model drives the enforced workflow or runs free. The
+structure, not a bigger model, is the difference.
+
+This is a preliminary independent run. Settings: `timeout_multiplier=1.0`, no
+resource overrides, `n_attempts=3`, `n_concurrent=4` (concurrency affects only
+parallelism, not per-trial scoring). A leaderboard submission is in progress;
+the open question on submission scope and concurrency is tracked at
+[grafana/o11y-bench#34](https://github.com/grafana/o11y-bench/issues/34).
+
+It is **not** a model-versus-model claim. Phoebe is a purpose-built
+investigation agent tuned against this category, so read the number as strong on
+this category, not a universal guarantee. The honest comparison is same-model:
+Phoebe plus Kimi versus the default agent plus Kimi.
+
+The earlier exploratory run below (five tasks, partial-credit means) predates
+this clean full-category run. It is kept for the boundary analysis and the MAST
+mapping, not as the current headline number.
+
+---
+
+# Earlier exploratory run: o11y-bench investigation set (first run)
 
 Date: 2026-05-25. A first, unoptimized run of the `phoebe` investigation
 harness on Grafana's o11y-bench, with a real grading pass.

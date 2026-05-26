@@ -19,7 +19,7 @@ A 1T-parameter open model (Kimi K2.6) stepping through a gated investigation on 
 
 ![Kimi K2.6 driven through the investigation by Theodosia](demos/hero.gif)
 
-On five Grafana o11y-bench tasks (four investigation-category plus one PromQL task), Pass^3, this FSM scores a mean of **0.765** with Kimi K2.6 via Together, against **0.717** for the same model with the raw Grafana toolset and no FSM. This is a partial run, not the full 11-task investigation category, so it is not directly comparable to the o11y-bench leaderboard's per-category scores; a clean full-category run is pending. See [RESULTS.md](RESULTS.md) for the breakdown and caveats.
+On o11y-bench's full 11-task investigation category, Pass^3, this FSM scores **0.75** with Kimi K2.6 via Together, against **0.68** for the same model on the raw Grafana toolset and no FSM, 33 trials per arm, same grader. Same model, same tasks: the structure, not a bigger model, is the difference. This is a preliminary independent run (n_concurrent=4); a leaderboard submission is in progress. See [RESULTS.md](RESULTS.md) for the breakdown and caveats.
 
 ## What it gives the caller
 
