@@ -90,7 +90,11 @@ def after_advance(to: str, distinct_backends: list[str], n_probes: int) -> str:
             "root_cause, final_answer, cascade_services=[]). conclude is blocked "
             "until a probe runs during this verify phase. Your final_answer should "
             "state the conclusion and cite the evidence you gathered. You must "
-            "conclude; do not trail off."
+            "conclude; do not trail off.\n\n"
+            "If your conclusion characterizes scope (isolated to one service versus "
+            "a broad or fleet-wide issue), verify it before stating it: query the "
+            "other services for the same symptom. Call it isolated only if they are "
+            "clean; call it broad only if they are also affected."
         )
     return (
         f"Phase: {to.upper()}. Keep investigating. Advance to 'verify' once you have "
