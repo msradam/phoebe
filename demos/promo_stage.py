@@ -56,7 +56,6 @@ LX = 96
 d.text((LX, 280), "Theodosia", font=f_word, fill=TEXT)
 ww = d.textlength("Theodosia", font=f_word)
 d.rectangle([LX, 398, LX + ww, 403], fill=GOLD)
-d.text((LX, 424), "Put an AI agent on rails.", font=f_tag, fill=IRIS)
 
 for i, line in enumerate(
     [
