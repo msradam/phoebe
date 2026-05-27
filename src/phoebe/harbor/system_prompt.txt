@@ -21,3 +21,18 @@ audit trail:
 
 Between start_investigation and conclude, use the Grafana tools directly.
 conclude is the only way to finish; do not stop without calling it.
+
+These control actions form a small state machine. You drive it; it will not
+advance on its own. Step through it in order:
+1. start_investigation first.
+2. Gather evidence: call the Grafana tools. Each call is recorded.
+3. advance_phase(to="diagnose") once you have a leading hypothesis.
+4. advance_phase(to="verify") once you have evidence from at least two distinct
+   telemetry backends (Prometheus, Loki, Tempo).
+5. In verify, run one more query that confirms or refutes the hypothesis.
+6. conclude(...).
+
+A refused action is never a dead end. If a call is blocked, the error states
+exactly what is missing (for example: reach the verify phase, gather a second
+backend, run a probe during verify). Do what the error says, then proceed. Keep
+moving toward conclude; do not repeat the same query or stall.
