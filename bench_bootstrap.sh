@@ -15,6 +15,8 @@ set -euo pipefail
 WORK="${WORK:-$HOME/bench}"
 NCONCURRENT="${NCONCURRENT:-2}"   # 2 for a 16GB box; 6-8 on a 32GB+ box
 PHOEBE_REF="${PHOEBE_REF:-main}"  # branch/commit of phoebe to benchmark
+MODEL="${MODEL:-openai/moonshotai/Kimi-K2.6}"  # driver model (litellm name)
+JOBTAG="${JOBTAG:-kimi}"          # job-name prefix, distinguishes model runs
 mkdir -p "$WORK" && cd "$WORK"
 
 # 1) Tooling: uv + mise
@@ -47,24 +49,25 @@ TASKS=(cache-incident-blast-radius cache-refresh-lag-handoff cache-rollout-trigg
        service-degradation-rca slow-path-hotspot-correlation)
 TASK_FLAGS=(); for t in "${TASKS[@]}"; do TASK_FLAGS+=(--task-name "$t"); done
 
-echo "================ KIMI FSM (Phoebe + Theodosia) full investigation $(date) ================"
+echo "================ FSM (Phoebe + Theodosia) $MODEL full investigation $(date) ================"
 OPENAI_API_BASE=https://api.together.xyz/v1 OPENAI_API_KEY="$TOGETHER_API_KEY" \
-mise run bench:job -- --model openai/moonshotai/Kimi-K2.6 \
+mise run bench:job -- --model "$MODEL" \
   --agent-import-path phoebe.harbor:PhoebeAgent --reasoning-effort off \
-  --n-attempts 3 --n-concurrent "$NCONCURRENT" --job-name kimi-inv-full-fsm "${TASK_FLAGS[@]}"
+  --n-attempts 3 --n-concurrent "$NCONCURRENT" --job-name "${JOBTAG}-inv-full-fsm" "${TASK_FLAGS[@]}"
 
-echo "================ KIMI base (raw tools) full investigation $(date) ================"
+echo "================ base (raw tools) $MODEL full investigation $(date) ================"
 OPENAI_API_BASE=https://api.together.xyz/v1 OPENAI_API_KEY="$TOGETHER_API_KEY" \
-mise run bench:job -- --model openai/moonshotai/Kimi-K2.6 \
+mise run bench:job -- --model "$MODEL" \
   --agent-import-path agents.o11y_agent:O11yBenchAgent --reasoning-effort off \
-  --n-attempts 3 --n-concurrent "$NCONCURRENT" --job-name kimi-inv-full-base "${TASK_FLAGS[@]}"
+  --n-attempts 3 --n-concurrent "$NCONCURRENT" --job-name "${JOBTAG}-inv-full-base" "${TASK_FLAGS[@]}"
 
 echo "================ DONE $(date) ================"
 # Headline mean per arm. Pass^3 (the leaderboard metric) is computed separately
 # from the per-trial rewards under jobs/<name>/*/verifier/reward.txt.
-python3 - <<'PY'
+JOBTAG="$JOBTAG" python3 - <<'PY'
 import json, glob, os, collections
-for j in ("kimi-inv-full-fsm", "kimi-inv-full-base"):
+tag = os.environ.get("JOBTAG", "kimi")
+for j in (f"{tag}-inv-full-fsm", f"{tag}-inv-full-base"):
     try:
         d = json.load(open(f"jobs/{j}/result.json"))
         v = list(d["stats"]["evals"].values())[0]
