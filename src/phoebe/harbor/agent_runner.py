@@ -482,29 +482,39 @@ async def drive_investigation(
             else:
                 # Full Grafana toolset: execute the real tool, then record it as
                 # evidence (which also enforces the loop guard and feeds the gate).
-                result = await call_grafana(c.name, c.arguments)
-                rec = await step_fsm(
-                    fsm_app,
-                    "record_probe",
-                    {
-                        "tool": c.name,
-                        "backend": infer_backend(c.name),
-                        "query": json.dumps(c.arguments, default=str)[:300],
-                        "result_summary": _result_summary(result),
-                    },
-                )
-                if rec.get("error"):
-                    obs = rec
-                    tag = rec["error"]
+                # A tool error (e.g. a wrong datasource uid) is returned to the
+                # model as a recoverable observation, not raised: a single bad
+                # call must not crash the run. Weaker models fumble uids/args and
+                # need to self-correct from the error. Failed calls are not
+                # recorded as evidence.
+                try:
+                    result = await call_grafana(c.name, c.arguments)
+                except Exception as e:  # noqa: BLE001 (surface as recoverable obs)
+                    obs = {"error": "tool_error", "tool": c.name, "message": str(e)[:400]}
+                    tag = "tool_error"
                 else:
-                    obs = {
-                        "ok": True,
-                        "tool": c.name,
-                        "result": result,
-                        "phase": rec["state"]["phase"],
-                        "current_prompt": rec["state"]["current_prompt"],
-                    }
-                    tag = "ok"
+                    rec = await step_fsm(
+                        fsm_app,
+                        "record_probe",
+                        {
+                            "tool": c.name,
+                            "backend": infer_backend(c.name),
+                            "query": json.dumps(c.arguments, default=str)[:300],
+                            "result_summary": _result_summary(result),
+                        },
+                    )
+                    if rec.get("error"):
+                        obs = rec
+                        tag = rec["error"]
+                    else:
+                        obs = {
+                            "ok": True,
+                            "tool": c.name,
+                            "result": result,
+                            "phase": rec["state"]["phase"],
+                            "current_prompt": rec["state"]["current_prompt"],
+                        }
+                        tag = "ok"
             log(f"[{step}] {c.name}({tag})")
             messages.append(
                 {"role": "tool", "tool_call_id": c.id, "content": json.dumps(obs, default=str)}
